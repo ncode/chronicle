@@ -4,6 +4,7 @@
 *.out
 /dist/
 
-# Local agent/editor tooling
+# Local-only tooling (not published)
 /.claude/
 /.codex/
+/tools/
