@@ -1,0 +1,10 @@
+/chronicle
+/chronicle-agent
+*.test
+*.out
+/dist/
+
+# Local-only tooling (not published)
+/.claude/
+/.codex/
+/tools/

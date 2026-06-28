@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" role="img" aria-label="Chronicle — every fact, across time">
+  <defs>
+    <filter id="mesh" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="70"/>
+    </filter>
+    <clipPath id="frame">
+      <rect width="1200" height="400"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#frame)">
+    <rect width="1200" height="400" fill="#ffffff"/>
+
+    <!-- Brand mesh gradient: a temporal sweep (past → present) across the upper half. -->
+    <g filter="url(#mesh)">
+      <circle cx="210" cy="90" r="170" fill="#7928ca" opacity="0.26"/>
+      <circle cx="410" cy="40" r="160" fill="#6366f1" opacity="0.26"/>
+      <circle cx="600" cy="90" r="170" fill="#007cf0" opacity="0.24"/>
+      <circle cx="560" cy="150" r="120" fill="#22d3ee" opacity="0.20"/>
+      <circle cx="790" cy="40" r="160" fill="#00dfd8" opacity="0.24"/>
+      <circle cx="950" cy="100" r="150" fill="#2dd4bf" opacity="0.20"/>
+      <circle cx="1060" cy="60" r="150" fill="#50e3c2" opacity="0.22"/>
+    </g>
+
+    <!-- caption-mono eyebrow -->
+    <text x="600" y="148" text-anchor="middle"
+          font-family="SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace"
+          font-size="13" letter-spacing="2" fill="#666666">CHRONICLE — PER-FACT TEMPORAL HISTORY</text>
+
+    <!-- display-xl headline: sentence case, period-terminated, negative tracking -->
+    <text x="600" y="230" text-anchor="middle"
+          font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="72" font-weight="600" letter-spacing="-3.6" fill="#000000">Every fact, across time.</text>
+
+    <!-- body-lg lead -->
+    <text x="600" y="282" text-anchor="middle"
+          font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif"
+          font-size="20" fill="#666666">Per-fact history for 50→100,000 nodes — now, state-at-T, and diff, in PostgreSQL.</text>
+
+    <!-- code eyebrow -->
+    <text x="600" y="340" text-anchor="middle"
+          font-family="SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace"
+          font-size="13" fill="#666666">&gt; os.name=Debian at 2026-03-14T06:00:00Z</text>
+
+    <!-- hairline base -->
+    <rect y="399" width="1200" height="1" fill="#ededed"/>
+  </g>
+</svg>

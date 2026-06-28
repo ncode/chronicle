@@ -1,0 +1,68 @@
+---
+name: Release artifacts
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+env:
+  CI: true
+
+permissions:
+  contents: write
+
+jobs:
+  dist:
+    name: Build and attach dist artifacts
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Resolve version from release tag
+        id: version
+        run: |
+          set -e
+          version="${{ github.event.release.tag_name }}"
+          if [ -z "$version" ]; then
+            version="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build dist matrix
+        run: make dist VERSION="${{ steps.version.outputs.version }}"
+
+      - name: Smoke linux artifacts
+        run: |
+          set -e
+          v="${{ steps.version.outputs.version }}"
+          for bin in chronicle chronicle-agent; do
+            tar -xzf "dist/${bin}-${v}-linux-amd64.tar.gz" -C /tmp
+            got="$(/tmp/${bin}-${v}-linux-amd64/${bin} -version)"
+            test "$got" = "$v"
+          done
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: chronicle-dist
+          path: |
+            dist/chronicle*-*.tar.gz
+            dist/chronicle*-*.zip
+            dist/SHA256SUMS
+
+      - name: Attach artifacts and checksums to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            dist/chronicle*-*.tar.gz \
+            dist/chronicle*-*.zip \
+            dist/SHA256SUMS \
+            --clobber
