@@ -1,0 +1,9 @@
+/chronicle
+/chronicle-agent
+*.test
+*.out
+/dist/
+
+# Local agent/editor tooling
+/.claude/
+/.codex/
