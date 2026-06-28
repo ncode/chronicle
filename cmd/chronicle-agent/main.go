@@ -16,6 +16,7 @@ import (
 
 	"github.com/ncode/chronicle/internal/agent"
 	"github.com/ncode/chronicle/internal/config"
+	"github.com/ncode/chronicle/internal/version"
 )
 
 func main() {
@@ -29,8 +30,13 @@ func run() error {
 	cfgPath := flag.String("config", "/etc/chronicle/agent.json", "path to agent config JSON")
 	dryRun := flag.Bool("dry-run", false, "discover facts once and print the push payload; no identity, no server")
 	externalDirs := flag.String("external-dirs", "", "comma-separated external fact dirs (dry-run convenience)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
 
+	if *showVersion {
+		fmt.Println(version.Version)
+		return nil
+	}
 	if *dryRun {
 		return runDryRun(*cfgPath, *externalDirs)
 	}

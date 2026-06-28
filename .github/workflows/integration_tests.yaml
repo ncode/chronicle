@@ -1,0 +1,42 @@
+---
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CI: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Full suite against a real Postgres, under the race detector. Serialized
+  # (-p 1): the integration tests share one database. This is where the
+  # concurrent-apply serialization test runs under -race.
+  postgres:
+    name: Postgres integration + race
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: chronicle_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      CHRONICLE_TEST_DB: postgres://postgres:postgres@localhost:5432/chronicle_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test -race -p 1 -timeout 180s ./...

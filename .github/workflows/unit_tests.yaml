@@ -1,0 +1,193 @@
+---
+name: Go tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CI: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Native build + unit tests + agent smoke on the GitHub-hosted OS set. The
+  # integration suite (which needs Postgres) self-skips here and runs in
+  # integration_tests.yaml.
+  go_tests:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux x64, os: ubuntu-latest }
+          - { name: Linux arm64, os: ubuntu-24.04-arm }
+          - { name: macOS arm64, os: macos-latest }
+          - { name: macOS x64, os: macos-13 }
+          - { name: Windows Server 2022, os: windows-2022 }
+          - { name: Windows Server 2025, os: windows-2025 }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test packages
+        run: go test ./...
+      - name: Build commands
+        run: go build ./...
+      # Cross-OS smoke: a non-empty snapshot proves facts.Discover() works here.
+      - name: Agent dry-run smoke
+        shell: bash
+        run: go run ./cmd/chronicle-agent -dry-run > /dev/null
+
+  # GitHub Actions has no native BSD/illumos runners, so these boot a real VM on
+  # the Linux runner, install the upstream Go toolchain pinned to go.mod, build,
+  # run the unit suite, and smoke the agent (facts.Discover() on that OS). This
+  # is the public, reproducible cross-OS functional gate.
+  freebsd_tests:
+    name: FreeBSD 14 (VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.3"
+          usesh: true
+          prepare: |
+            set -e
+            ver=$(awk '$1=="go"{print $2; exit}' go.mod)
+            fetch -o /tmp/go.tgz "https://go.dev/dl/go${ver}.freebsd-amd64.tar.gz"
+            mkdir -p /usr/local && rm -rf /usr/local/go
+            gunzip -c /tmp/go.tgz | tar -xf - -C /usr/local
+          run: |
+            set -e
+            export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
+            go version
+            go build ./...
+            go test ./...
+            go build -o /tmp/chronicle-agent ./cmd/chronicle-agent
+            /tmp/chronicle-agent -dry-run > /dev/null
+
+  openbsd_tests:
+    name: OpenBSD 7.9 (VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.9"
+          usesh: true
+          prepare: |
+            set -e
+            ver=$(awk '$1=="go"{print $2; exit}' go.mod)
+            ftp -o /tmp/go.tgz "https://go.dev/dl/go${ver}.openbsd-amd64.tar.gz"
+            mkdir -p /usr/local && rm -rf /usr/local/go
+            gunzip -c /tmp/go.tgz | tar -xf - -C /usr/local
+          run: |
+            set -e
+            export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
+            go version
+            go build ./...
+            go test ./...
+            go build -o /tmp/chronicle-agent ./cmd/chronicle-agent
+            /tmp/chronicle-agent -dry-run > /dev/null
+
+  netbsd_tests:
+    name: NetBSD 10.1 (VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/netbsd-vm@v1
+        with:
+          release: "10.1"
+          usesh: true
+          prepare: |
+            set -e
+            ver=$(awk '$1=="go"{print $2; exit}' go.mod)
+            ftp -o /tmp/go.tgz "https://go.dev/dl/go${ver}.netbsd-amd64.tar.gz"
+            mkdir -p /usr/local && rm -rf /usr/local/go
+            gunzip -c /tmp/go.tgz | tar -xf - -C /usr/local
+          run: |
+            set -e
+            export PATH=/usr/local/go/bin:/usr/bin:/bin:/usr/sbin:/sbin GOFLAGS=-buildvcs=false
+            go version
+            go build ./...
+            go test ./...
+            go build -o /tmp/chronicle-agent ./cmd/chronicle-agent
+            /tmp/chronicle-agent -dry-run > /dev/null
+
+  dragonfly_tests:
+    name: DragonFly BSD 6.4.2 (VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/dragonflybsd-vm@v1
+        with:
+          release: "6.4.2"
+          usesh: true
+          prepare: |
+            set -e
+            pkg install -y curl ca_root_nss
+            ver=$(awk '$1=="go"{print $2; exit}' go.mod)
+            curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${ver}.dragonfly-amd64.tar.gz"
+            mkdir -p /usr/local && rm -rf /usr/local/go
+            tar -xzf /tmp/go.tgz -C /usr/local
+          run: |
+            set -e
+            export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
+            go version
+            go build ./...
+            go test ./...
+            go build -o /tmp/chronicle-agent ./cmd/chronicle-agent
+            /tmp/chronicle-agent -dry-run > /dev/null
+
+  omnios_tests:
+    name: OmniOS r151058 / illumos (VM)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/omnios-vm@v1
+        with:
+          release: "r151058"
+          usesh: true
+          prepare: |
+            set -e
+            command -v curl >/dev/null 2>&1 || pkg install web/curl || pkg install curl
+            command -v gtar >/dev/null 2>&1 || pkg install archiver/gnu-tar
+            ver=$(awk '$1=="go"{print $2; exit}' go.mod)
+            curl -fsSL -o /tmp/go.tgz "https://go.dev/dl/go${ver}.illumos-amd64.tar.gz"
+            mkdir -p /usr/local && rm -rf /usr/local/go
+            gtar -xzf /tmp/go.tgz -C /usr/local
+          run: |
+            set -e
+            export PATH=/usr/local/go/bin:$PATH GOFLAGS=-buildvcs=false
+            go version
+            go build ./...
+            go test ./...
+            go build -o /tmp/chronicle-agent ./cmd/chronicle-agent
+            /tmp/chronicle-agent -dry-run > /dev/null
+
+  # Build-only coverage for the targets without a runner or VM (arm variants,
+  # plan9 — agent only). Mirrors `make cross-compile`.
+  cross_compile:
+    name: Cross-compile matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: make cross-compile

@@ -26,6 +26,7 @@ import (
 	"github.com/ncode/chronicle/internal/monitor"
 	"github.com/ncode/chronicle/internal/query"
 	"github.com/ncode/chronicle/internal/store"
+	"github.com/ncode/chronicle/internal/version"
 )
 
 func main() {
@@ -37,7 +38,12 @@ func main() {
 
 func run() error {
 	cfgPath := flag.String("config", "/etc/chronicle/server.json", "path to server config JSON")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return nil
+	}
 
 	cfg, err := config.LoadServer(*cfgPath)
 	if err != nil {
