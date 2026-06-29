@@ -156,55 +156,71 @@ func (s *Service) record(resp wire.PushResponse, producerTS, received time.Time,
 	s.metrics.Rejects.WithLabelValues(reason).Inc()
 }
 
-// Apply runs the full ingest contract for one push under the given (verified)
-// certname. Split from the HTTP layer so it is testable without TLS.
-func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, received time.Time) (wire.PushResponse, int) {
+// pendingLeaf is one durable leaf — classified and hashed but not yet interned
+// (no path_id). plan() produces these; Apply interns them under the pool.
+type pendingLeaf struct {
+	path, factName string
+	value          json.RawMessage
+	hash           [32]byte
+}
+
+// pushPlan is the DB-independent result of one push: the anchored producer time,
+// the durable leaves pending intern, the volatile blob, and the discovery-clean
+// flag. Everything in it is computed without a database.
+type pushPlan struct {
+	producerTS time.Time
+	pending    []pendingLeaf
+	volBlob    json.RawMessage
+	clean      bool
+}
+
+// plan does all the DB-independent work of one push: anchor and validate the
+// producer timestamp, decode and flatten the tree, enforce the leaf/path/value
+// caps and the skew bound, and classify + hash every leaf into durable (pending
+// intern) vs volatile. It is pure — no context, no store — so the whole reject
+// contract is unit-testable without Postgres. A nil plan means the push is
+// rejected; the returned (response, status) is what Apply should return.
+func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, received time.Time) (*pushPlan, wire.PushResponse, int) {
 	// Anchor on the node clock at microsecond resolution (Postgres timestamptz
 	// resolution) so the staleness guard and stored valid_from/valid_to agree; a
 	// missing/zero timestamp is rejected rather than written as year-0001.
 	producerTS := push.ProducerTimestamp.Truncate(time.Microsecond)
 	if producerTS.IsZero() {
-		return wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest
+		return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
 	}
 
 	tree, err := decodeTree(push.Tree)
 	if err != nil {
-		return wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest
+		return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
 	}
 	leaves := wire.Flatten(tree)
-	if len(leaves) > s.cfg.MaxLeafCount {
-		return oversized("leaf-count")
+	if len(leaves) > cfg.MaxLeafCount {
+		return planReject(oversized("leaf-count"))
 	}
 
 	// Skew upper bound is server-clock-only — reject early, before any DB work.
-	if producerTS.After(received.Add(s.cfg.MaxSkew.D())) {
-		return wire.PushResponse{Reason: wire.ReasonSkewed}, http.StatusConflict
+	if producerTS.After(received.Add(cfg.MaxSkew.D())) {
+		return planReject(wire.PushResponse{Reason: wire.ReasonSkewed}, http.StatusConflict)
 	}
 
 	// Classify, hash, and cap-check every leaf WITHOUT interning yet — interning
-	// (which grows the shared, never-GC'd fact_paths dictionary) is deferred until
-	// after the per-node guards, so a stale/deactivated/oversized push can never
-	// pollute the dictionary or path cache.
-	classifier := s.classifier.Load()
-	type pendingLeaf struct {
-		path, factName string
-		value          json.RawMessage
-		hash           [32]byte
-	}
+	// (which grows the shared, never-GC'd fact_paths dictionary) is deferred to
+	// Apply, after the per-node guards, so a stale/deactivated/oversized push can
+	// never pollute the dictionary or path cache.
 	pending := make([]pendingLeaf, 0, len(leaves))
 	volatile := make(map[string]any, 8)
 	for _, lf := range leaves {
-		if len(lf.Path) > s.cfg.MaxPathLen {
-			return oversized("path-length")
+		if len(lf.Path) > cfg.MaxPathLen {
+			return planReject(oversized("path-length"))
 		}
 		raw, err := json.Marshal(lf.Value)
 		if err != nil {
-			return wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest
+			return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
 		}
-		if len(raw) > s.cfg.MaxValueBytes {
-			return oversized("value-bytes")
+		if len(raw) > cfg.MaxValueBytes {
+			return planReject(oversized("value-bytes"))
 		}
-		if classifier.IsVolatile(lf.Path) {
+		if cl.IsVolatile(lf.Path) {
 			volatile[lf.Path] = lf.Value
 			continue
 		}
@@ -212,9 +228,34 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 	}
 	volBlob, err := json.Marshal(volatile)
 	if err != nil {
-		return internalErr()
+		return planReject(internalErr())
 	}
-	clean := push.Discovery.Clean()
+
+	return &pushPlan{
+		producerTS: producerTS,
+		pending:    pending,
+		volBlob:    volBlob,
+		clean:      push.Discovery.Clean(),
+	}, wire.PushResponse{}, 0
+}
+
+// planReject is the rejected-plan return: a nil plan plus the (response, status)
+// to surface. The (resp, status) helpers (oversized, internalErr) compose into it.
+func planReject(resp wire.PushResponse, status int) (*pushPlan, wire.PushResponse, int) {
+	return nil, resp, status
+}
+
+// Apply runs the full ingest contract for one push under the given (verified)
+// certname. Split from the HTTP layer so it is testable without TLS. The
+// DB-independent work is plan()'s; Apply adds the per-node interning and the
+// serialized atomic transaction on top of the plan.
+func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, received time.Time) (wire.PushResponse, int) {
+	// Snapshot the volatile policy once for the whole push (it is hot-swapped on
+	// SIGHUP); plan() is pure, so the policy is passed in rather than loaded inside.
+	pl, resp, status := plan(s.cfg, s.classifier.Load(), push, received)
+	if pl == nil {
+		return resp, status
+	}
 
 	// Cheap non-locking pre-check: reject a deactivated or clearly-stale push
 	// BEFORE interning, so a rejected push doesn't grow the shared, never-GC'd
@@ -223,7 +264,7 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 		if peek.Deactivated != nil {
 			return wire.PushResponse{Reason: wire.ReasonDeactivated}, http.StatusForbidden
 		}
-		if peek.LastProducerTS != nil && !producerTS.After(*peek.LastProducerTS) {
+		if peek.LastProducerTS != nil && !pl.producerTS.After(*peek.LastProducerTS) {
 			return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
 		}
 	}
@@ -231,8 +272,8 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 	// Intern on the pool (autocommit) BEFORE opening the per-node tx — never while
 	// holding the tx connection, or concurrent lock-waiters could exhaust the pool
 	// and deadlock the lock winner mid-intern.
-	durable := make([]store.DurableLeaf, 0, len(pending))
-	for _, p := range pending {
+	durable := make([]store.DurableLeaf, 0, len(pl.pending))
+	for _, p := range pl.pending {
 		pid, err := s.store.InternPath(ctx, p.path, p.factName)
 		if err != nil {
 			s.log.Error("intern path", "path", p.path, "err", err)
@@ -259,11 +300,11 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 		return wire.PushResponse{Reason: wire.ReasonDeactivated}, http.StatusForbidden
 	}
 	// Lower bound (staleness): strictly monotonic per-node producer time.
-	if node.LastProducerTS != nil && !producerTS.After(*node.LastProducerTS) {
+	if node.LastProducerTS != nil && !pl.producerTS.After(*node.LastProducerTS) {
 		return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
 	}
 
-	stats, err := s.store.ApplyDurable(ctx, tx, node.ID, durable, producerTS, clean)
+	stats, err := s.store.ApplyDurable(ctx, tx, node.ID, durable, pl.producerTS, pl.clean)
 	if err != nil {
 		if errors.Is(err, store.ErrStaleApply) {
 			return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
@@ -271,11 +312,11 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 		s.log.Error("apply durable", "certname", certname, "err", err)
 		return internalErr()
 	}
-	if err := s.store.UpsertVolatile(ctx, tx, node.ID, volBlob, producerTS); err != nil {
+	if err := s.store.UpsertVolatile(ctx, tx, node.ID, pl.volBlob, pl.producerTS); err != nil {
 		s.log.Error("upsert volatile", "certname", certname, "err", err)
 		return internalErr()
 	}
-	if err := s.store.MarkContact(ctx, tx, node.ID, received, &producerTS); err != nil {
+	if err := s.store.MarkContact(ctx, tx, node.ID, received, &pl.producerTS); err != nil {
 		s.log.Error("mark contact", "certname", certname, "err", err)
 		return internalErr()
 	}
