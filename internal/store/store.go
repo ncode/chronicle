@@ -179,6 +179,13 @@ var ErrNodeNotFound = errors.New("node not found")
 // interval. Ingest maps it to a stale reject (not a 500).
 var ErrStaleApply = errors.New("producer_timestamp not after newest stored interval")
 
+// ErrDeactivated and ErrStale are the per-node guard rejections ApplySnapshot
+// returns, so the caller maps them to typed responses without touching SQL.
+var (
+	ErrDeactivated = errors.New("node deactivated")
+	ErrStale       = errors.New("stale push")
+)
+
 // ResetProducerTS clears a node's last_producer_ts so subsequent in-bounds
 // pushes are accepted again — the operator recovery for a watermark poisoned by
 // a far-future stamp (ADR-0009 §2, task 3.9).
@@ -414,6 +421,95 @@ func (s *Store) UpsertVolatile(ctx context.Context, tx pgx.Tx, nodeID int64, blo
 		   SET volatile = EXCLUDED.volatile, observed_at = EXCLUDED.observed_at`,
 		nodeID, string(blob), observedAt)
 	return err
+}
+
+// ── Per-node atomic apply (ADR-0009 §3) ──────────────────────────────────────
+
+// PendingLeaf is one classified Durable leaf before interning: its dotted path
+// and first segment (for the fact_paths dictionary), the raw jsonb value, and the
+// content hash. ApplySnapshot interns these into DurableLeaf under the pool.
+type PendingLeaf struct {
+	Path, FactName string
+	Value          json.RawMessage
+	Hash           [32]byte
+}
+
+// ApplySnapshot is the per-node serialized atomic apply (ADR-0009 §3): it owns
+// the whole transaction and the ordering invariant that keeps it deadlock-free.
+//
+// Interning runs on the pool (autocommit) BEFORE the per-node tx opens — never
+// while holding the tx connection, or concurrent lock-waiters could exhaust the
+// pool and deadlock the lock winner mid-intern. The single tx then holds the
+// FOR UPDATE lock to run the authoritative guards, the durable diff, the volatile
+// upsert, and the watermark advance.
+//
+// The cheap unlocked PeekNode pre-check is a best-effort optimization: it skips
+// interning for a push that is ALREADY stale/deactivated, so the common rejected
+// case doesn't grow the shared, never-GC'd fact_paths dictionary. It is NOT
+// authoritative — a node that turns stale/deactivated between the peek and the
+// lock, or a first-contact node the peek can't see, may still intern before the
+// locked guards reject it; the per-node cardinality alarm (task 7.2) backstops
+// that residual dictionary growth.
+//
+// Returns ErrDeactivated / ErrStale for the guard rejections; any other error is
+// an internal failure with the failing step wrapped.
+func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, producerTS time.Time, pending []PendingLeaf, volBlob json.RawMessage, clean bool) (ApplyStats, error) {
+	// Cheap non-locking pre-check before interning (the authoritative guards
+	// re-run under the lock below).
+	if peek, ok, err := s.PeekNode(ctx, certname); err == nil && ok {
+		if peek.Deactivated != nil {
+			return ApplyStats{}, ErrDeactivated
+		}
+		if peek.LastProducerTS != nil && !producerTS.After(*peek.LastProducerTS) {
+			return ApplyStats{}, ErrStale
+		}
+	}
+
+	// Intern on the pool BEFORE opening the tx — never while holding the tx
+	// connection, or concurrent lock-waiters could exhaust the pool and deadlock.
+	durable := make([]DurableLeaf, 0, len(pending))
+	for _, p := range pending {
+		pid, err := s.InternPath(ctx, p.Path, p.FactName)
+		if err != nil {
+			return ApplyStats{}, fmt.Errorf("intern path %q: %w", p.Path, err)
+		}
+		durable = append(durable, DurableLeaf{PathID: pid, Value: p.Value, Hash: p.Hash})
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return ApplyStats{}, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
+
+	node, err := s.LockNode(ctx, tx, certname)
+	if err != nil {
+		return ApplyStats{}, fmt.Errorf("lock node: %w", err)
+	}
+	if node.Deactivated != nil {
+		return ApplyStats{}, ErrDeactivated
+	}
+	if node.LastProducerTS != nil && !producerTS.After(*node.LastProducerTS) {
+		return ApplyStats{}, ErrStale
+	}
+
+	stats, err := s.ApplyDurable(ctx, tx, node.ID, durable, producerTS, clean)
+	if err != nil {
+		if errors.Is(err, ErrStaleApply) {
+			return ApplyStats{}, ErrStale
+		}
+		return ApplyStats{}, fmt.Errorf("apply durable: %w", err)
+	}
+	if err := s.UpsertVolatile(ctx, tx, node.ID, volBlob, producerTS); err != nil {
+		return ApplyStats{}, fmt.Errorf("upsert volatile: %w", err)
+	}
+	if err := s.MarkContact(ctx, tx, node.ID, received, &producerTS); err != nil {
+		return ApplyStats{}, fmt.Errorf("mark contact: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return ApplyStats{}, fmt.Errorf("commit: %w", err)
+	}
+	return stats, nil
 }
 
 // ── Reconstruction reads (task 2.6) ──────────────────────────────────────────

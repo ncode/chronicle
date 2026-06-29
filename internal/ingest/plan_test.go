@@ -91,7 +91,7 @@ func TestPlanClassifiesAndSplits(t *testing.T) {
 		t.Fatalf("producerTS = %s, want %s", pl.producerTS, planReceived)
 	}
 	// os.name is durable; uptime and load.1m are volatile.
-	if len(pl.pending) != 1 || pl.pending[0].path != "os.name" {
+	if len(pl.pending) != 1 || pl.pending[0].Path != "os.name" {
 		t.Fatalf("pending durable = %+v, want exactly [os.name]", pl.pending)
 	}
 	var vol map[string]json.RawMessage

@@ -156,20 +156,12 @@ func (s *Service) record(resp wire.PushResponse, producerTS, received time.Time,
 	s.metrics.Rejects.WithLabelValues(reason).Inc()
 }
 
-// pendingLeaf is one durable leaf — classified and hashed but not yet interned
-// (no path_id). plan() produces these; Apply interns them under the pool.
-type pendingLeaf struct {
-	path, factName string
-	value          json.RawMessage
-	hash           [32]byte
-}
-
 // pushPlan is the DB-independent result of one push: the anchored producer time,
 // the durable leaves pending intern, the volatile blob, and the discovery-clean
 // flag. Everything in it is computed without a database.
 type pushPlan struct {
 	producerTS time.Time
-	pending    []pendingLeaf
+	pending    []store.PendingLeaf
 	volBlob    json.RawMessage
 	clean      bool
 }
@@ -207,7 +199,7 @@ func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, receiv
 	// (which grows the shared, never-GC'd fact_paths dictionary) is deferred to
 	// Apply, after the per-node guards, so a stale/deactivated/oversized push can
 	// never pollute the dictionary or path cache.
-	pending := make([]pendingLeaf, 0, len(leaves))
+	pending := make([]store.PendingLeaf, 0, len(leaves))
 	volatile := make(map[string]any, 8)
 	for _, lf := range leaves {
 		if len(lf.Path) > cfg.MaxPathLen {
@@ -224,7 +216,7 @@ func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, receiv
 			volatile[lf.Path] = lf.Value
 			continue
 		}
-		pending = append(pending, pendingLeaf{lf.Path, lf.FactName, raw, store.ValueHash(lf.Value)})
+		pending = append(pending, store.PendingLeaf{Path: lf.Path, FactName: lf.FactName, Value: raw, Hash: store.ValueHash(lf.Value)})
 	}
 	volBlob, err := json.Marshal(volatile)
 	if err != nil {
@@ -257,71 +249,16 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 		return resp, status
 	}
 
-	// Cheap non-locking pre-check: reject a deactivated or clearly-stale push
-	// BEFORE interning, so a rejected push doesn't grow the shared, never-GC'd
-	// dictionary. The authoritative guards re-run under the per-node lock below.
-	if peek, ok, perr := s.store.PeekNode(ctx, certname); perr == nil && ok {
-		if peek.Deactivated != nil {
-			return wire.PushResponse{Reason: wire.ReasonDeactivated}, http.StatusForbidden
-		}
-		if peek.LastProducerTS != nil && !pl.producerTS.After(*peek.LastProducerTS) {
-			return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
-		}
-	}
-
-	// Intern on the pool (autocommit) BEFORE opening the per-node tx — never while
-	// holding the tx connection, or concurrent lock-waiters could exhaust the pool
-	// and deadlock the lock winner mid-intern.
-	durable := make([]store.DurableLeaf, 0, len(pl.pending))
-	for _, p := range pl.pending {
-		pid, err := s.store.InternPath(ctx, p.path, p.factName)
-		if err != nil {
-			s.log.Error("intern path", "path", p.path, "err", err)
-			return internalErr()
-		}
-		durable = append(durable, store.DurableLeaf{PathID: pid, Value: p.value, Hash: p.hash})
-	}
-
-	// Per-node serialized atomic apply (ADR-0009 §3): one tx, lock → authoritative
-	// guards → diff → volatile → advance watermark.
-	tx, err := s.store.Pool().Begin(ctx)
-	if err != nil {
-		s.log.Error("begin tx", "certname", certname, "err", err)
-		return internalErr()
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
-
-	node, err := s.store.LockNode(ctx, tx, certname)
-	if err != nil {
-		s.log.Error("lock node", "certname", certname, "err", err)
-		return internalErr()
-	}
-	if node.Deactivated != nil {
+	// The per-node intern + serialized atomic transaction (and the ordering
+	// invariant that keeps it deadlock-free) live in the store.
+	stats, err := s.store.ApplySnapshot(ctx, certname, received, pl.producerTS, pl.pending, pl.volBlob, pl.clean)
+	switch {
+	case errors.Is(err, store.ErrDeactivated):
 		return wire.PushResponse{Reason: wire.ReasonDeactivated}, http.StatusForbidden
-	}
-	// Lower bound (staleness): strictly monotonic per-node producer time.
-	if node.LastProducerTS != nil && !pl.producerTS.After(*node.LastProducerTS) {
+	case errors.Is(err, store.ErrStale):
 		return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
-	}
-
-	stats, err := s.store.ApplyDurable(ctx, tx, node.ID, durable, pl.producerTS, pl.clean)
-	if err != nil {
-		if errors.Is(err, store.ErrStaleApply) {
-			return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
-		}
-		s.log.Error("apply durable", "certname", certname, "err", err)
-		return internalErr()
-	}
-	if err := s.store.UpsertVolatile(ctx, tx, node.ID, pl.volBlob, pl.producerTS); err != nil {
-		s.log.Error("upsert volatile", "certname", certname, "err", err)
-		return internalErr()
-	}
-	if err := s.store.MarkContact(ctx, tx, node.ID, received, &pl.producerTS); err != nil {
-		s.log.Error("mark contact", "certname", certname, "err", err)
-		return internalErr()
-	}
-	if err := tx.Commit(ctx); err != nil {
-		s.log.Error("commit", "certname", certname, "err", err)
+	case err != nil:
+		s.log.Error("apply snapshot", "certname", certname, "err", err)
 		return internalErr()
 	}
 
