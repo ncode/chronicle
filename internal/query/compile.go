@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ncode/chronicle/internal/ingest"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -32,20 +33,72 @@ func (a *argBuf) p(v any) string {
 	return "$" + strconv.Itoa(len(a.args))
 }
 
-// Run compiles and executes a parsed query. includeInactive re-includes
+// Run executes a parsed query: validate, resolve paths (the only I/O), compile to
+// SQL (a pure transformation), then execute. includeInactive re-includes
 // deactivated/expired nodes (default excludes them — fact-query spec).
 func (e *Engine) Run(ctx context.Context, q *Query, includeInactive bool) (*Result, error) {
 	if err := e.checkVolatileHistory(q); err != nil {
 		return nil, err
 	}
+	paths, err := e.resolvePaths(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	sql, args, empty, err := compile(q, e.classifier, paths, includeInactive)
+	if err != nil {
+		return nil, err
+	}
+	if empty { // a term/group references an unknown path -> no node can match
+		return &Result{Shape: q.Shape}, nil
+	}
 	switch q.Shape {
 	case ShapeFilter:
-		return e.runFilter(ctx, q, includeInactive)
+		return e.execFilter(ctx, sql, args)
 	case ShapeGroupBy:
-		return e.runGroupBy(ctx, q, includeInactive)
+		return e.execGroupBy(ctx, sql, args)
 	default:
 		return nil, ErrUnsupported
 	}
+}
+
+// resolvePaths turns every path the query references into its path_id — the only
+// database I/O in the read path, hoisted here so compile stays pure.
+//
+// Resolution is eager (every referenced path, up front). Unlike the old lazy
+// short-circuit, a genuine LookupPath DB error surfaces as a query error instead
+// of a silent empty result — deliberate: don't mask a failing database. (A plain
+// not-found is still just a miss → unknown path → empty result, unchanged.)
+//
+// ponytail: resolves blindly without classifying. A Volatile path was never
+// interned into fact_paths, so LookupPath simply misses and the path is absent
+// from the map; compile then routes it to node_volatile on its own. Keeping
+// classification solely in compile is the point of the seam — don't re-add it here.
+func (e *Engine) resolvePaths(ctx context.Context, q *Query) (map[string]int64, error) {
+	paths := make(map[string]int64)
+	resolve := func(p string) error {
+		if _, done := paths[p]; done {
+			return nil
+		}
+		pid, ok, err := e.store.LookupPath(ctx, p)
+		if err != nil {
+			return err
+		}
+		if ok {
+			paths[p] = pid
+		}
+		return nil
+	}
+	for _, t := range q.Terms {
+		if err := resolve(t.Path); err != nil {
+			return nil, err
+		}
+	}
+	if q.Shape == ShapeGroupBy {
+		if err := resolve(q.GroupField); err != nil {
+			return nil, err
+		}
+	}
+	return paths, nil
 }
 
 // checkVolatileHistory enforces: a volatile path with an explicit `at <T>` has
@@ -65,46 +118,41 @@ func (e *Engine) checkVolatileHistory(q *Query) error {
 	return nil
 }
 
-func (e *Engine) runFilter(ctx context.Context, q *Query, includeInactive bool) (*Result, error) {
+// compile turns a parsed Query into SQL + positional args. It is a pure function:
+// no context, no database, no store — every path_id it needs is supplied in the
+// resolved `paths` map. empty is true when a term or group-by references an
+// unknown durable path, so the query can match nothing and no SQL should run.
+// This is the read surface's test surface: assert the SQL string, no Postgres.
+func compile(q *Query, cl *ingest.Classifier, paths map[string]int64, includeInactive bool) (sql string, args []any, empty bool, err error) {
 	ab := &argBuf{}
-	intersect, empty, err := e.buildIntersect(ctx, ab, q.Terms, q.At)
-	if err != nil {
-		return nil, err
-	}
-	if empty { // a term references an unknown path -> no node can match
-		return &Result{Shape: ShapeFilter}, nil
-	}
-	sql := "SELECT n.certname FROM nodes n WHERE n.node_id IN (" + intersect + ")" +
-		activeClause("n", includeInactive) + " ORDER BY n.certname"
-
-	rows, err := e.store.Pool().Query(ctx, sql, ab.args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	res := &Result{Shape: ShapeFilter}
-	for rows.Next() {
-		var cn string
-		if err := rows.Scan(&cn); err != nil {
-			return nil, err
+	switch q.Shape {
+	case ShapeFilter:
+		intersect, empty := buildIntersect(ab, cl, paths, q.Terms, q.At)
+		if empty {
+			return "", nil, true, nil
 		}
-		res.Nodes = append(res.Nodes, cn)
+		s := "SELECT n.certname FROM nodes n WHERE n.node_id IN (" + intersect + ")" +
+			activeClause("n", includeInactive) + " ORDER BY n.certname"
+		return s, ab.args, false, nil
+	case ShapeGroupBy:
+		s, empty := buildGroupBySQL(ab, q, cl, paths, includeInactive)
+		if empty {
+			return "", nil, true, nil
+		}
+		return s, ab.args, false, nil
+	default:
+		return "", nil, false, ErrUnsupported
 	}
-	return res, rows.Err()
 }
 
-func (e *Engine) runGroupBy(ctx context.Context, q *Query, includeInactive bool) (*Result, error) {
-	ab := &argBuf{}
-	intersect, empty, err := e.buildIntersect(ctx, ab, q.Terms, q.At)
-	if err != nil {
-		return nil, err
-	}
+func buildGroupBySQL(ab *argBuf, q *Query, cl *ingest.Classifier, paths map[string]int64, includeInactive bool) (sql string, empty bool) {
+	intersect, empty := buildIntersect(ab, cl, paths, q.Terms, q.At)
 	if empty {
-		return &Result{Shape: ShapeGroupBy}, nil
+		return "", true
 	}
 
 	var src, selectExpr, groupCols, pathPred, idCol, existPred string
-	if e.classifier.IsVolatile(q.GroupField) {
+	if cl.IsVolatile(q.GroupField) {
 		// at != nil already rejected; now-only volatile group from node_volatile.
 		src = "node_volatile gv"
 		selectExpr = "gv.volatile -> " + ab.p(q.GroupField)
@@ -114,12 +162,9 @@ func (e *Engine) runGroupBy(ctx context.Context, q *Query, includeInactive bool)
 		// (`?` distinguishes a missing key from a real JSON null value).
 		existPred = "gv.volatile ? " + ab.p(q.GroupField)
 	} else {
-		pid, ok, err := e.store.LookupPath(ctx, q.GroupField)
-		if err != nil {
-			return nil, err
-		}
+		pid, ok := paths[q.GroupField]
 		if !ok {
-			return &Result{Shape: ShapeGroupBy}, nil // unknown group path -> no groups
+			return "", true // unknown group path -> no groups
 		}
 		selectExpr = "gf.value"
 		// Group by value_hash so type-distinct look-alikes (1 vs 1.0) don't merge.
@@ -146,8 +191,62 @@ func (e *Engine) runGroupBy(ctx context.Context, q *Query, includeInactive bool)
 	}
 	b.WriteString(activeClause("n", includeInactive))
 	fmt.Fprintf(&b, " GROUP BY %s ORDER BY count(*) DESC, %s", groupCols, selectExpr)
+	return b.String(), false
+}
 
-	rows, err := e.store.Pool().Query(ctx, b.String(), ab.args...)
+// buildIntersect builds an INTERSECT of per-term node_id subqueries. empty is
+// true if any durable term references an unknown path (so nothing can match).
+func buildIntersect(ab *argBuf, cl *ingest.Classifier, paths map[string]int64, terms []Term, at *time.Time) (sql string, empty bool) {
+	parts := make([]string, 0, len(terms))
+	for _, t := range terms {
+		sub, empty := termSubquery(ab, cl, paths, t, at)
+		if empty {
+			return "", true
+		}
+		parts = append(parts, "("+sub+")")
+	}
+	return strings.Join(parts, " INTERSECT "), false
+}
+
+func termSubquery(ab *argBuf, cl *ingest.Classifier, paths map[string]int64, t Term, at *time.Time) (sql string, empty bool) {
+	if cl.IsVolatile(t.Path) {
+		jsonVal, _ := json.Marshal(t.Value)
+		return "SELECT node_id FROM node_volatile WHERE volatile -> " + ab.p(t.Path) +
+			" = " + ab.p(string(jsonVal)) + "::jsonb", false
+	}
+	pid, ok := paths[t.Path]
+	if !ok {
+		return "", true
+	}
+	h := store.ValueHash(t.Value)
+	if at == nil {
+		return "SELECT node_id FROM current_facts WHERE path_id = " + ab.p(pid) +
+			" AND value_hash = " + ab.p(h[:]), false
+	}
+	// at-T goes through facts_at(), not raw fact_history (fact-query spec).
+	return "SELECT node_id FROM facts_at(" + ab.p(*at) + ") WHERE path_id = " + ab.p(pid) +
+		" AND value_hash = " + ab.p(h[:]), false
+}
+
+func (e *Engine) execFilter(ctx context.Context, sql string, args []any) (*Result, error) {
+	rows, err := e.store.Pool().Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	res := &Result{Shape: ShapeFilter}
+	for rows.Next() {
+		var cn string
+		if err := rows.Scan(&cn); err != nil {
+			return nil, err
+		}
+		res.Nodes = append(res.Nodes, cn)
+	}
+	return res, rows.Err()
+}
+
+func (e *Engine) execGroupBy(ctx context.Context, sql string, args []any) (*Result, error) {
+	rows, err := e.store.Pool().Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -161,46 +260,6 @@ func (e *Engine) runGroupBy(ctx context.Context, q *Query, includeInactive bool)
 		res.Groups = append(res.Groups, g)
 	}
 	return res, rows.Err()
-}
-
-// buildIntersect builds an INTERSECT of per-term node_id subqueries. empty is
-// true if any durable term references an unknown path (so nothing can match).
-func (e *Engine) buildIntersect(ctx context.Context, ab *argBuf, terms []Term, at *time.Time) (string, bool, error) {
-	parts := make([]string, 0, len(terms))
-	for _, t := range terms {
-		sub, empty, err := e.termSubquery(ctx, ab, t, at)
-		if err != nil {
-			return "", false, err
-		}
-		if empty {
-			return "", true, nil
-		}
-		parts = append(parts, "("+sub+")")
-	}
-	return strings.Join(parts, " INTERSECT "), false, nil
-}
-
-func (e *Engine) termSubquery(ctx context.Context, ab *argBuf, t Term, at *time.Time) (sql string, empty bool, err error) {
-	if e.classifier.IsVolatile(t.Path) {
-		jsonVal, _ := json.Marshal(t.Value)
-		return "SELECT node_id FROM node_volatile WHERE volatile -> " + ab.p(t.Path) +
-			" = " + ab.p(string(jsonVal)) + "::jsonb", false, nil
-	}
-	pid, ok, err := e.store.LookupPath(ctx, t.Path)
-	if err != nil {
-		return "", false, err
-	}
-	if !ok {
-		return "", true, nil
-	}
-	h := store.ValueHash(t.Value)
-	if at == nil {
-		return "SELECT node_id FROM current_facts WHERE path_id = " + ab.p(pid) +
-			" AND value_hash = " + ab.p(h[:]), false, nil
-	}
-	// at-T goes through facts_at(), not raw fact_history (fact-query spec).
-	return "SELECT node_id FROM facts_at(" + ab.p(*at) + ") WHERE path_id = " + ab.p(pid) +
-		" AND value_hash = " + ab.p(h[:]), false, nil
 }
 
 func activeClause(alias string, includeInactive bool) string {
