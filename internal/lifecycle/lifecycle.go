@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ncode/chronicle/internal/periodic"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -35,27 +36,16 @@ func (m *Manager) Sweep(ctx context.Context) (int64, error) {
 // Run sweeps every interval until ctx is cancelled. Errors are logged, not fatal
 // (a missed sweep is harmless; the next one catches up).
 func (m *Manager) Run(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		m.log.Error("expiry sweep interval must be positive", "interval", interval)
-		return
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
+	periodic.Run(ctx, interval, m.log, "expiry sweep", func(ctx context.Context) {
+		n, err := m.Sweep(ctx)
+		if err != nil {
+			m.log.Error("expiry sweep", "err", err)
 			return
-		case <-t.C:
-			n, err := m.Sweep(ctx)
-			if err != nil {
-				m.log.Error("expiry sweep", "err", err)
-				continue
-			}
-			if n > 0 {
-				m.log.Info("expiry sweep", "newly_expired", n)
-			}
 		}
-	}
+		if n > 0 {
+			m.log.Info("expiry sweep", "newly_expired", n)
+		}
+	})
 }
 
 // Deactivate sunsets a node (terminal). Returns the seal time.

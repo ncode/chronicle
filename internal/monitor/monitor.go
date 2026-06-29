@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/ncode/chronicle/internal/periodic"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -39,34 +40,23 @@ func New(st *store.Store, log *slog.Logger) *Monitor {
 
 // Run scans on each tick until ctx is cancelled.
 func (m *Monitor) Run(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		m.log.Error("monitor interval must be positive", "interval", interval)
-		return
-	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			churn, err := m.CheckChurn(ctx)
-			if err != nil {
-				m.log.Error("churn scan", "err", err)
-			}
-			for _, f := range churn {
-				m.log.Warn("high-churn durable path; consider adding to the volatile policy",
-					"path", f.Key, "opens", f.Count, "window", m.churnWindow.String())
-			}
-			card, err := m.CheckCardinality(ctx)
-			if err != nil {
-				m.log.Error("cardinality scan", "err", err)
-			}
-			for _, f := range card {
-				m.log.Warn("per-node fact_paths cardinality spike", "certname", f.Key, "paths", f.Count)
-			}
+	periodic.Run(ctx, interval, m.log, "monitor", func(ctx context.Context) {
+		churn, err := m.CheckChurn(ctx)
+		if err != nil {
+			m.log.Error("churn scan", "err", err)
 		}
-	}
+		for _, f := range churn {
+			m.log.Warn("high-churn durable path; consider adding to the volatile policy",
+				"path", f.Key, "opens", f.Count, "window", m.churnWindow.String())
+		}
+		card, err := m.CheckCardinality(ctx)
+		if err != nil {
+			m.log.Error("cardinality scan", "err", err)
+		}
+		for _, f := range card {
+			m.log.Warn("per-node fact_paths cardinality spike", "certname", f.Key, "paths", f.Count)
+		}
+	})
 }
 
 // CheckChurn flags Durable paths that opened an abnormal number of intervals in
