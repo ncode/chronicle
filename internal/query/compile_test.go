@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ncode/chronicle/internal/ingest"
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -20,9 +20,9 @@ func h(v any) []byte {
 	return x[:]
 }
 
-func compileTestClassifier(t *testing.T) *ingest.Classifier {
+func compileTestClassifier(t *testing.T) *classify.Policy {
 	t.Helper()
-	cl, err := ingest.NewClassifier([]string{"uptime", "memory.system.*"})
+	cl, err := classify.New([]string{"uptime", "memory.system.*"})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,12 +1,15 @@
-package ingest
+package classify
 
 import "testing"
 
+// benchPatterns mirror a typical deployment's volatile policy.
+var benchPatterns = []string{"uptime", "uptime_seconds", "load*", "memory.system.available_bytes", "memory.swap.available_bytes"}
+
 // BenchmarkIsVolatile measures the per-leaf classification (regex scan over all
-// volatile patterns). Runs once per leaf per push. The "miss" case is worst-case:
-// it scans every compiled pattern without an early match.
+// volatile patterns). The "miss" case is worst-case: it scans every compiled
+// pattern without an early match.
 func BenchmarkIsVolatile(b *testing.B) {
-	cl, err := NewClassifier(realisticVolatilePatterns)
+	cl, err := New(benchPatterns)
 	if err != nil {
 		b.Fatal(err)
 	}

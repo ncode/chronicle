@@ -44,6 +44,13 @@ value and never writes it to history — historizing volatile facts is the domin
 storage bloat.
 _Avoid_: telemetry fact, metric
 
+**Volatile policy**:
+The configured set of glob patterns that classifies each Fact path as Volatile (matched) or
+Durable (the default). Lives in `internal/classify` as `classify.Policy`; shared by ingest
+(write-side classification) and query (read-side routing and at-T rejection), and hot-reloaded
+on SIGHUP so the two endpoints never disagree.
+_Avoid_: filter, rules
+
 **Source**:
 The resolver or external script that produces a Fact (e.g. the `networking` resolver, or an
 external `rpm_packages.sh` script). Chronicle records each Fact's Source so it can tell a

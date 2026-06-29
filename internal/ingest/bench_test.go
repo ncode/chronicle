@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/store"
 	"github.com/ncode/chronicle/internal/wire"
 )
@@ -63,7 +64,7 @@ type pendingLeafBench struct {
 // tx is layered on top of it), not a microbenchmark of one function.
 func BenchmarkApplyCPU(b *testing.B) {
 	raw := json.RawMessage(nodeSnapshot)
-	cl, err := NewClassifier(realisticVolatilePatterns)
+	cl, err := classify.New(realisticVolatilePatterns)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -111,7 +112,7 @@ func TestSnapshotLeafCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cl, err := NewClassifier(realisticVolatilePatterns)
+	cl, err := classify.New(realisticVolatilePatterns)
 	if err != nil {
 		t.Fatal(err)
 	}

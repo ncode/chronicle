@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/time/rate"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/metrics"
 	"github.com/ncode/chronicle/internal/store"
@@ -32,8 +33,8 @@ type Service struct {
 	cfg   *config.ServerConfig
 	log   *slog.Logger
 
-	classifier atomic.Pointer[Classifier] // hot-swappable volatile policy (task 7.1)
-	metrics    *metrics.Metrics           // nil-safe; set by the server
+	classifier atomic.Pointer[classify.Policy] // hot-swappable volatile policy (task 7.1)
+	metrics    *metrics.Metrics                // nil-safe; set by the server
 
 	sem chan struct{} // bounded ingest concurrency (backpressure)
 
@@ -42,7 +43,7 @@ type Service struct {
 }
 
 func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service, error) {
-	cl, err := NewClassifier(cfg.VolatilePaths)
+	cl, err := classify.New(cfg.VolatilePaths)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +64,7 @@ func (s *Service) SetMetrics(m *metrics.Metrics) { s.metrics = m }
 // ReloadVolatilePolicy rebuilds and atomically swaps the volatile classifier
 // (SIGHUP-driven hot reload, task 7.1). Unchanged on a bad pattern.
 func (s *Service) ReloadVolatilePolicy(patterns []string) error {
-	cl, err := NewClassifier(patterns)
+	cl, err := classify.New(patterns)
 	if err != nil {
 		return err
 	}

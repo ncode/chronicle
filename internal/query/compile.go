@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ncode/chronicle/internal/ingest"
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -123,7 +123,7 @@ func (e *Engine) checkVolatileHistory(q *Query) error {
 // resolved `paths` map. empty is true when a term or group-by references an
 // unknown durable path, so the query can match nothing and no SQL should run.
 // This is the read surface's test surface: assert the SQL string, no Postgres.
-func compile(q *Query, cl *ingest.Classifier, paths map[string]int64, includeInactive bool) (sql string, args []any, empty bool, err error) {
+func compile(q *Query, cl *classify.Policy, paths map[string]int64, includeInactive bool) (sql string, args []any, empty bool, err error) {
 	ab := &argBuf{}
 	switch q.Shape {
 	case ShapeFilter:
@@ -145,7 +145,7 @@ func compile(q *Query, cl *ingest.Classifier, paths map[string]int64, includeIna
 	}
 }
 
-func buildGroupBySQL(ab *argBuf, q *Query, cl *ingest.Classifier, paths map[string]int64, includeInactive bool) (sql string, empty bool) {
+func buildGroupBySQL(ab *argBuf, q *Query, cl *classify.Policy, paths map[string]int64, includeInactive bool) (sql string, empty bool) {
 	intersect, empty := buildIntersect(ab, cl, paths, q.Terms, q.At)
 	if empty {
 		return "", true
@@ -196,7 +196,7 @@ func buildGroupBySQL(ab *argBuf, q *Query, cl *ingest.Classifier, paths map[stri
 
 // buildIntersect builds an INTERSECT of per-term node_id subqueries. empty is
 // true if any durable term references an unknown path (so nothing can match).
-func buildIntersect(ab *argBuf, cl *ingest.Classifier, paths map[string]int64, terms []Term, at *time.Time) (sql string, empty bool) {
+func buildIntersect(ab *argBuf, cl *classify.Policy, paths map[string]int64, terms []Term, at *time.Time) (sql string, empty bool) {
 	parts := make([]string, 0, len(terms))
 	for _, t := range terms {
 		sub, empty := termSubquery(ab, cl, paths, t, at)
@@ -208,7 +208,7 @@ func buildIntersect(ab *argBuf, cl *ingest.Classifier, paths map[string]int64, t
 	return strings.Join(parts, " INTERSECT "), false
 }
 
-func termSubquery(ab *argBuf, cl *ingest.Classifier, paths map[string]int64, t Term, at *time.Time) (sql string, empty bool) {
+func termSubquery(ab *argBuf, cl *classify.Policy, paths map[string]int64, t Term, at *time.Time) (sql string, empty bool) {
 	if cl.IsVolatile(t.Path) {
 		jsonVal, _ := json.Marshal(t.Value)
 		return "SELECT node_id FROM node_volatile WHERE volatile -> " + ab.p(t.Path) +
