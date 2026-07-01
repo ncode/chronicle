@@ -1,9 +1,9 @@
-package ingest
+package classify
 
 import "testing"
 
-func TestClassifier(t *testing.T) {
-	c, err := NewClassifier([]string{"uptime", "memory.system.*", "load*"})
+func TestPolicy(t *testing.T) {
+	c, err := New([]string{"uptime", "memory.system.*", "load*"})
 	if err != nil {
 		t.Fatal(err)
 	}

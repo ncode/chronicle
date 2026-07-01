@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ncode/chronicle/internal/ingest"
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -35,7 +35,7 @@ func testEngine(t *testing.T) (*Engine, *store.Store, context.Context) {
 	if _, err := st.Pool().Exec(ctx, `TRUNCATE nodes, fact_paths RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
-	cl, err := ingest.NewClassifier([]string{"uptime", "memory.system.*"})
+	cl, err := classify.New([]string{"uptime", "memory.system.*"})
 	if err != nil {
 		t.Fatal(err)
 	}
