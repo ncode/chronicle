@@ -10,19 +10,19 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
-	"github.com/ncode/chronicle/internal/ingest"
 	"github.com/ncode/chronicle/internal/store"
 )
 
 // Engine compiles and runs DSL queries against the temporal store.
 type Engine struct {
 	store      *store.Store
-	classifier *ingest.Classifier
+	classifier *classify.Policy
 }
 
 // NewEngine builds a query Engine over the store with a volatile classifier.
-func NewEngine(st *store.Store, cl *ingest.Classifier) *Engine {
+func NewEngine(st *store.Store, cl *classify.Policy) *Engine {
 	return &Engine{store: st, classifier: cl}
 }
 
@@ -38,7 +38,7 @@ type Service struct {
 // NewService builds the read service, including the volatile classifier (shared
 // policy with ingest) and the authenticator.
 func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service, error) {
-	cl, err := ingest.NewClassifier(cfg.VolatilePaths)
+	cl, err := classify.New(cfg.VolatilePaths)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +55,7 @@ func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, 
 // volatile routing / at-rejection stays consistent with ingest after a SIGHUP
 // reload (task 7.1, keeps the two endpoints from disagreeing).
 func (s *Service) ReloadVolatilePolicy(patterns []string) error {
-	cl, err := ingest.NewClassifier(patterns)
+	cl, err := classify.New(patterns)
 	if err != nil {
 		return err
 	}

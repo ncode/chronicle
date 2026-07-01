@@ -20,6 +20,7 @@ import (
 
 	"github.com/ncode/facts"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/ingest"
 	"github.com/ncode/chronicle/internal/query"
@@ -294,7 +295,7 @@ type queryEngine struct{ store *store.Store }
 
 func (e *queryEngine) filter(t *testing.T, ctx context.Context, dsl string) []string {
 	t.Helper()
-	cl, err := ingest.NewClassifier(testServerConfig().VolatilePaths)
+	cl, err := classify.New(testServerConfig().VolatilePaths)
 	if err != nil {
 		t.Fatal(err)
 	}
