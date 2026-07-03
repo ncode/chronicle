@@ -24,8 +24,9 @@ func testAgent(srv *httptest.Server) *Agent {
 	}
 }
 
-func emptyPush() wire.Push {
-	return wire.Push{ProducerTimestamp: time.Now(), Tree: json.RawMessage(`{}`)}
+func emptyBody() []byte {
+	b, _ := json.Marshal(wire.Push{ProducerTimestamp: time.Now(), Tree: json.RawMessage(`{}`)})
+	return b
 }
 
 func TestPushRetryThenSuccess(t *testing.T) {
@@ -40,7 +41,7 @@ func TestPushRetryThenSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	testAgent(srv).pushWithRetry(context.Background(), emptyPush())
+	testAgent(srv).pushWithRetry(context.Background(), emptyBody())
 	if got := n.Load(); got != 2 {
 		t.Fatalf("expected retry then success (2 calls), got %d", got)
 	}
@@ -54,7 +55,7 @@ func TestPushOversizedIsTerminal(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	testAgent(srv).pushWithRetry(context.Background(), emptyPush())
+	testAgent(srv).pushWithRetry(context.Background(), emptyBody())
 	if got := n.Load(); got != 1 {
 		t.Fatalf("413 must be terminal (1 call), got %d", got)
 	}
@@ -70,7 +71,7 @@ func TestPushGivesUpAfterBoundedRetries(t *testing.T) {
 	defer srv.Close()
 
 	a := testAgent(srv) // RetryAttempts=3 => 4 total attempts
-	a.pushWithRetry(context.Background(), emptyPush())
+	a.pushWithRetry(context.Background(), emptyBody())
 	if got := n.Load(); got != 4 {
 		t.Fatalf("expected bounded 4 attempts, got %d", got)
 	}

@@ -21,7 +21,7 @@ func testEngine(t *testing.T) (*Engine, *store.Store, context.Context) {
 		t.Skip("set CHRONICLE_TEST_DB to run query integration tests")
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,7 +56,7 @@ func seed(t *testing.T, st *store.Store, ctx context.Context, certname string, a
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	node, err := st.LockNode(ctx, tx, certname)
+	node, _, err := st.LockNode(ctx, tx, certname)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -30,7 +30,7 @@ func testStore(t *testing.T) (*Store, context.Context) {
 	t.Helper()
 	dsn := testDSN(t)
 	ctx := context.Background()
-	s, err := Open(ctx, dsn)
+	s, err := Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -52,7 +52,7 @@ func freshNode(t *testing.T, s *Store, ctx context.Context, certname string) int
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	n, err := s.LockNode(ctx, tx, certname)
+	n, _, err := s.LockNode(ctx, tx, certname)
 	if err != nil {
 		t.Fatalf("lock node: %v", err)
 	}

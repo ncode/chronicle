@@ -38,6 +38,6 @@ func BenchmarkFlatten(b *testing.B) {
 	tree := benchTree(b, benchSnapshot)
 	b.ReportAllocs()
 	for b.Loop() {
-		_ = Flatten(tree)
+		_, _ = Flatten(tree, FlattenLimits{})
 	}
 }

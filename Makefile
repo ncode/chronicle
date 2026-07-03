@@ -12,7 +12,7 @@ SHA256 := $(shell command -v sha256sum >/dev/null 2>&1 && echo "sha256sum" || ec
 AGENT_TARGETS  ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm freebsd/arm64 openbsd/amd64 openbsd/arm openbsd/arm64 netbsd/amd64 netbsd/arm netbsd/arm64 dragonfly/amd64 illumos/amd64 plan9/amd64
 SERVER_TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 freebsd/amd64 freebsd/arm freebsd/arm64 openbsd/amd64 openbsd/arm openbsd/arm64 netbsd/amd64 netbsd/arm netbsd/arm64 dragonfly/amd64 illumos/amd64
 
-.PHONY: build vet test race test-integration test-db cross-compile dist tidy clean
+.PHONY: build vet test race bench test-integration test-db cross-compile dist tidy clean
 
 build:
 	$(GO) build -ldflags '$(LDFLAGS)' -o chronicle ./cmd/chronicle
@@ -29,12 +29,19 @@ test:
 race:
 	$(GO) test -race ./internal/store ./internal/ingest
 
-# Integration tests against a real Postgres (CHRONICLE_TEST_DB). They share one
-# DB, so run serially.
+# Benchmarks (CPU/alloc floors). Store benchmarks self-skip without
+# CHRONICLE_TEST_DB; wrap in scripts/with-test-db.sh to include them.
+bench:
+	$(GO) test -run '^$$' -bench=. -benchmem ./internal/store ./internal/ingest ./internal/wire
+
+# Integration tests against a real Postgres (CHRONICLE_TEST_DB). MUST run with
+# -p 1: DB-backed tests isolate via TRUNCATE on shared tables, so parallel
+# packages would clobber each other's rows.
 test-integration:
 	$(GO) test -p 1 -timeout 120s ./...
 
-# Spin a throwaway Postgres and run the full suite against it.
+# Spin a throwaway Postgres and run the full suite against it. -p 1 for the same
+# TRUNCATE-based isolation reason as test-integration.
 test-db:
 	./scripts/with-test-db.sh $(GO) test -p 1 -timeout 120s ./...
 
@@ -81,4 +88,5 @@ tidy:
 clean:
 	$(GO) clean
 	rm -f chronicle chronicle-agent
+	find . -name '*.test' -type f -delete
 	rm -rf $(DIST_DIR)

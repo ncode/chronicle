@@ -25,7 +25,7 @@ func testService(t *testing.T) (*Service, *store.Store, context.Context) {
 		t.Skip("set CHRONICLE_TEST_DB to run ingest integration tests")
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,9 @@ func mkPush(tree string, ts time.Time, status wire.DiscoveryStatus) *wire.Push {
 }
 
 var (
-	clean = wire.DiscoveryStatus{}
+	// A real push always carries a discovery report; an empty report is now a
+	// degenerate reject (task 1.1), so the clean fixture is a non-empty ok report.
+	clean = wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}}
 	dirty = wire.DiscoveryStatus{External: map[string]string{"/etc/facts.d/rpm.sh": wire.StatusError}}
 
 	t1 = time.Date(2026, 1, 1, 10, 0, 0, 0, time.UTC)
@@ -232,21 +234,21 @@ func TestApplyConcurrentSerialized(t *testing.T) {
 
 func itoa(i int) string { return string(rune('0'+i/10)) + string(rune('0'+i%10)) }
 
-func TestApplyDedupCollidingPaths(t *testing.T) {
+func TestApplyRejectsCollidingPaths(t *testing.T) {
 	svc, st, ctx := testService(t)
 	wipeNode(t, st, ctx, "collide.example")
 
-	// {"a":{"b":1},"a.b":2} flattens to the SAME leaf path "a.b" twice -> one
-	// path_id. Without dedup this trips the unique/PK/CHECK constraints and 500s.
+	// {"a":{"b":1},"a.b":2} flattens to the SAME leaf path "a.b" twice. Rather
+	// than let map order pick a winner (fabricating history churn), the push is
+	// rejected as a bad request naming the colliding path (task 2.2).
 	resp, status := svc.Apply(ctx, "collide.example",
 		mkPush(`{"a":{"b":1},"a.b":2}`, t1, clean), t1)
-	if status != http.StatusOK || !resp.Applied {
-		t.Fatalf("colliding-path push must apply cleanly, got %d %+v", status, resp)
+	if status != http.StatusBadRequest || !strings.HasPrefix(resp.Reason, wire.ReasonBadRequest) || !strings.Contains(resp.Reason, "a.b") {
+		t.Fatalf("colliding-path push must be rejected naming the path, got %d %+v", status, resp)
 	}
-	id := nodeID(t, st, ctx, "collide.example")
-	now, _ := st.Now(ctx, id)
-	if len(now) != 1 || now[0].Path != "a.b" {
-		t.Fatalf("dedup should leave exactly one a.b interval: %+v", now)
+	// Nothing was written for a node that never got a valid push.
+	if _, ok, _ := st.PeekNode(ctx, "collide.example"); ok {
+		t.Fatal("rejected colliding push must not create a node")
 	}
 }
 
@@ -271,6 +273,58 @@ func TestApplyDegenerateGuardAfterReset(t *testing.T) {
 	now, _ := st.Now(ctx, id)
 	if len(now) != 1 || string(now[0].Value) != `"A"` {
 		t.Fatalf("rejected push must not change state: %+v", now)
+	}
+}
+
+// After a watermark reset the node's LastProducerTS is nil, which LOOKS like
+// first contact — but the node exists, so the first-contact clock bound must NOT
+// apply (a far-past recovery push is rejected as stale by the overlap guard, not
+// skewed), keeping the reset recovery path usable.
+func TestResetNodeNotTreatedAsFirstContact(t *testing.T) {
+	svc, st, ctx := testService(t)
+	wipeNode(t, st, ctx, "reset.example")
+	now := time.Now()
+
+	if _, status := svc.Apply(ctx, "reset.example", mkPush(`{"os":{"name":"A"}}`, now.Add(-time.Minute), clean), now); status != http.StatusOK {
+		t.Fatalf("establish node = %d", status)
+	}
+	if err := st.ResetProducerTS(ctx, "reset.example"); err != nil {
+		t.Fatal(err)
+	}
+	// A far-past push after reset: nil watermark, but an existing node → stale
+	// (overlaps the open interval), NOT skewed (first-contact bound must not fire).
+	resp, status := svc.Apply(ctx, "reset.example", mkPush(`{"os":{"name":"B"}}`, now.Add(-365*24*time.Hour), clean), now)
+	if status != http.StatusConflict || resp.Reason != wire.ReasonStale {
+		t.Fatalf("post-reset far-past push = %d %+v, want 409 stale (not skewed)", status, resp)
+	}
+}
+
+// A clean push that flattens to ONLY volatile leaves (zero durable) — e.g. an
+// over-broad volatile policy — must NOT tombstone the node's durable history; it
+// carries forward while still applying volatile (a932 fleet-wide-wipe guard).
+func TestVolatileOnlyPushDoesNotTombstoneDurable(t *testing.T) {
+	svc, st, ctx := testService(t)
+	wipeNode(t, st, ctx, "volonly.example")
+
+	// Seed a durable fact (os.name) plus a volatile one (uptime is volatile in cfg).
+	if _, status := svc.Apply(ctx, "volonly.example", mkPush(`{"os":{"name":"Debian"},"uptime":1}`, t1, clean), t1); status != http.StatusOK {
+		t.Fatalf("seed = %d", status)
+	}
+	id := nodeID(t, st, ctx, "volonly.example")
+	if now, _ := st.Now(ctx, id); len(now) != 1 || now[0].Path != "os.name" {
+		t.Fatalf("seed durable = %+v, want [os.name]", now)
+	}
+
+	// Next pass reports ONLY a volatile fact, clean discovery → zero durable leaves.
+	resp, status := svc.Apply(ctx, "volonly.example", mkPush(`{"uptime":2}`, t2, clean), t2)
+	if status != http.StatusOK || !resp.Applied {
+		t.Fatalf("volatile-only push = %d %+v", status, resp)
+	}
+	if resp.Tombstoned != 0 {
+		t.Fatalf("volatile-only clean push must not tombstone, got %d", resp.Tombstoned)
+	}
+	if now, _ := st.Now(ctx, id); len(now) != 1 || now[0].Path != "os.name" {
+		t.Fatalf("durable history must survive a volatile-only push: %+v", now)
 	}
 }
 

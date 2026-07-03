@@ -13,18 +13,14 @@ import (
 	"github.com/ncode/chronicle/internal/wire"
 )
 
-// pushWithRetry POSTs the payload, retrying only on 503 and transport failures
-// with jittered backoff (honoring Retry-After) up to RetryAttempts. Guard
-// rejects (stale/skewed) and oversize are terminal for this snapshot — retrying
-// the same body cannot help. After exhausting retries it defers to the next
-// timer; there is no durable spool (data path is loss-tolerant, gaps visible).
-func (a *Agent) pushWithRetry(ctx context.Context, payload wire.Push) {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		a.log.Error("marshal push", "err", err)
-		return
-	}
-
+// pushWithRetry POSTs the already-serialized body, retrying only on 503 and
+// transport failures with jittered backoff (honoring Retry-After) up to
+// RetryAttempts. Guard rejects (stale/skewed) and oversize are terminal for this
+// snapshot — retrying the same body cannot help. After exhausting retries it
+// defers to the next timer; there is no durable spool (data path is
+// loss-tolerant, gaps visible). The caller marshals once (and pre-checks the
+// serialized size against the server cap), so no re-marshal happens here.
+func (a *Agent) pushWithRetry(ctx context.Context, body []byte) {
 	var retryAfter time.Duration
 	for attempt := 0; attempt <= a.cfg.RetryAttempts; attempt++ {
 		if attempt > 0 {

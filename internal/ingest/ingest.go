@@ -40,6 +40,13 @@ type Service struct {
 
 	limMu    sync.Mutex
 	limiters map[string]*rate.Limiter // per-certname rate limiters
+
+	// Per-node consecutive-dirty-pass tracking (task 5.2): a node whose pushes
+	// stay discovery-dirty has its tombstones frozen by the carry-forward gate
+	// (ADR-0009 §1); once the streak crosses the threshold it becomes visible.
+	streakMu    sync.Mutex
+	dirtyStreak map[string]int // certname -> consecutive dirty applied passes
+	dirtyOver   int            // count of certnames at/over the threshold (gauge source)
 }
 
 func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service, error) {
@@ -48,11 +55,12 @@ func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service,
 		return nil, err
 	}
 	s := &Service{
-		store:    st,
-		cfg:      cfg,
-		log:      log,
-		sem:      make(chan struct{}, cfg.MaxConcurrent),
-		limiters: make(map[string]*rate.Limiter),
+		store:       st,
+		cfg:         cfg,
+		log:         log,
+		sem:         make(chan struct{}, cfg.MaxConcurrent),
+		limiters:    make(map[string]*rate.Limiter),
+		dirtyStreak: make(map[string]int),
 	}
 	s.classifier.Store(cl)
 	return s, nil
@@ -95,49 +103,78 @@ func (s *Service) handlePush(w http.ResponseWriter, r *http.Request) {
 
 	certname, err := certnameFromChain(r)
 	if err != nil {
-		writeResp(w, http.StatusForbidden, wire.PushResponse{Reason: wire.ReasonNoClientCert})
+		// Unauthenticated: not counted as contact (no verified certname).
+		s.reject(w, http.StatusForbidden, wire.ReasonNoClientCert, "")
 		return
 	}
 
-	// Per-certname rate limit: one node cannot monopolize ingest.
+	// Per-certname rate limit: one node cannot monopolize ingest. Load-shedding,
+	// so exempt from contact (the node's admitted pushes already register it).
 	if !s.allow(certname) {
-		w.Header().Set("Retry-After", "10")
-		writeResp(w, http.StatusTooManyRequests, wire.PushResponse{Reason: wire.ReasonRateLimited})
+		s.reject(w, http.StatusTooManyRequests, wire.ReasonRateLimited, "10")
 		return
 	}
 
 	// Backpressure: bounded concurrency, fast-fail rather than unbounded buffer.
+	// Also load-shedding: MUST NOT add a store write while the store is saturated.
 	select {
 	case s.sem <- struct{}{}:
 		defer func() { <-s.sem }()
 	default:
-		w.Header().Set("Retry-After", "5")
-		writeResp(w, http.StatusServiceUnavailable, wire.PushResponse{Reason: wire.ReasonBackpressure})
+		s.reject(w, http.StatusServiceUnavailable, wire.ReasonBackpressure, "5")
 		return
 	}
 
+	// Past this point the push is authenticated and admitted (not load-shed), so
+	// every outcome counts as contact for the expiry sweep (lifecycle spec):
+	// applied pushes advance last_seen in the apply tx; rejects get a single-row
+	// touch here so a node stuck on rejects is never falsely swept as Expired.
 	// Body byte cap (the other caps need the decoded tree — enforced in Apply).
 	r.Body = http.MaxBytesReader(w, r.Body, s.cfg.MaxSnapshotByte)
 	push, err := decodePush(r.Body)
 	if err != nil {
+		s.markRejectContact(r.Context(), certname)
 		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
-			writeResp(w, http.StatusRequestEntityTooLarge,
-				wire.PushResponse{Reason: wire.ReasonOversized + ": snapshot-bytes"})
+			s.reject(w, http.StatusRequestEntityTooLarge, wire.ReasonOversized+": snapshot-bytes", "")
 			return
 		}
-		writeResp(w, http.StatusBadRequest, wire.PushResponse{Reason: wire.ReasonBadRequest})
+		s.reject(w, http.StatusBadRequest, wire.ReasonBadRequest, "")
 		return
 	}
 
 	resp, status := s.Apply(r.Context(), certname, push, received)
 	s.record(resp, push.ProducerTimestamp, received, time.Since(received))
-	if status == http.StatusServiceUnavailable {
-		w.Header().Set("Retry-After", "5")
+	if !resp.Applied {
+		s.markRejectContact(r.Context(), certname)
 	}
 	writeResp(w, status, resp)
 }
 
-// record updates Prometheus metrics for one push (nil-safe).
+// reject writes a typed reject response (optionally with Retry-After) and counts
+// it, so every pre-apply reject path — no-cert, rate-limit, backpressure,
+// body-size, malformed JSON — appears in the metrics, not only apply-path
+// rejects (task 5.1).
+func (s *Service) reject(w http.ResponseWriter, status int, reason, retryAfter string) {
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	s.countReject(reason)
+	writeResp(w, status, wire.PushResponse{Reason: reason})
+}
+
+// markRejectContact advances last_seen for a rejected-but-admitted push so a
+// node stuck on rejects is not swept as Expired (task 3.1). Best-effort: a
+// failed touch is logged, never fatal, and no-ops for an unknown/deactivated
+// node. `expired` is intentionally NOT cleared here — only an applied push
+// un-expires a node.
+func (s *Service) markRejectContact(ctx context.Context, certname string) {
+	if err := s.store.TouchContact(ctx, certname); err != nil {
+		s.log.Warn("touch contact on reject", "certname", certname, "err", err)
+	}
+}
+
+// record updates Prometheus metrics for one applied-or-rejected apply outcome
+// (nil-safe).
 func (s *Service) record(resp wire.PushResponse, producerTS, received time.Time, dur time.Duration) {
 	if s.metrics == nil {
 		return
@@ -148,46 +185,82 @@ func (s *Service) record(resp wire.PushResponse, producerTS, received time.Time,
 		s.metrics.LagSec.Observe(received.Sub(producerTS).Seconds())
 		return
 	}
+	s.countReject(resp.Reason)
+}
+
+// countReject increments the rejected-push counters for a typed reason
+// (nil-safe). The reason label is collapsed to its prefix so the sub-cause after
+// ':' (e.g. "oversized: leaf-count") does not inflate label cardinality.
+func (s *Service) countReject(reason string) {
+	if s.metrics == nil {
+		return
+	}
 	s.metrics.Pushes.WithLabelValues("rejected").Inc()
-	reason := resp.Reason
 	if i := strings.IndexByte(reason, ':'); i >= 0 {
-		reason = reason[:i] // collapse "oversized: leaf-count" -> "oversized"
+		reason = reason[:i]
 	}
 	s.metrics.Rejects.WithLabelValues(reason).Inc()
 }
 
 // pushPlan is the DB-independent result of one push: the anchored producer time,
-// the durable leaves pending intern, the volatile blob, and the discovery-clean
-// flag. Everything in it is computed without a database.
+// the receive time and skew bound (carried so the store can enforce the
+// first-contact past bound under the node lock, which plan() — being DB-free —
+// cannot), the durable leaves pending intern, the volatile blob, and the
+// discovery-clean flag. Everything in it is computed without a database.
 type pushPlan struct {
 	producerTS time.Time
+	received   time.Time
+	maxSkew    time.Duration
 	pending    []store.PendingLeaf
 	volBlob    json.RawMessage
 	clean      bool
 }
 
 // plan does all the DB-independent work of one push: anchor and validate the
-// producer timestamp, decode and flatten the tree, enforce the leaf/path/value
-// caps and the skew bound, and classify + hash every leaf into durable (pending
-// intern) vs volatile. It is pure — no context, no store — so the whole reject
-// contract is unit-testable without Postgres. A nil plan means the push is
-// rejected; the returned (response, status) is what Apply should return.
+// producer timestamp, reject a degenerate push (no report / empty tree), decode
+// and flatten the tree, enforce the leaf/path/value caps and the skew upper
+// bound, and classify + hash every leaf into durable (pending intern) vs
+// volatile. It is pure — no context, no store — so the whole reject contract is
+// unit-testable without Postgres. A nil plan means the push is rejected; the
+// returned (response, status) is what Apply should return.
 func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, received time.Time) (*pushPlan, wire.PushResponse, int) {
 	// Anchor on the node clock at microsecond resolution (Postgres timestamptz
 	// resolution) so the staleness guard and stored valid_from/valid_to agree; a
 	// missing/zero timestamp is rejected rather than written as year-0001.
 	producerTS := push.ProducerTimestamp.Truncate(time.Microsecond)
 	if producerTS.IsZero() {
-		return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
+		return planReject(badRequest())
+	}
+
+	// Degenerate-push rejection (task 1.1): a push carrying NO discovery report is
+	// evidence of nothing and must never be read as a discovery-clean pass that
+	// tombstones the node's whole durable history.
+	if len(push.Discovery.Builtin) == 0 && len(push.Discovery.External) == 0 {
+		return planReject(badRequest())
 	}
 
 	tree, err := decodeTree(push.Tree)
 	if err != nil {
-		return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
+		return planReject(badRequest())
 	}
-	leaves := wire.Flatten(tree)
-	if len(leaves) > cfg.MaxLeafCount {
-		return planReject(oversized("leaf-count"))
+	// Caps are enforced incrementally during flattening (task 2.3): an over-cap
+	// body is abandoned at the first violation, never fully materialized.
+	leaves, err := wire.Flatten(tree, wire.FlattenLimits{MaxLeafCount: cfg.MaxLeafCount, MaxPathLen: cfg.MaxPathLen})
+	if err != nil {
+		if ce, ok := errors.AsType[*wire.CapError](err); ok {
+			return planReject(oversized(ce.Which))
+		}
+		if col, ok := errors.AsType[*wire.CollisionError](err); ok {
+			// Name the colliding path so an operator can find the broken producer.
+			return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest + ": colliding path " + col.Path}, http.StatusBadRequest)
+		}
+		return planReject(badRequest())
+	}
+	// Degenerate-push rejection (task 1.1): an empty/zero-leaf tree would
+	// otherwise be applied as a discovery-clean snapshot in which every fact
+	// disappeared, tombstoning the node's entire durable history.
+	if len(leaves) == 0 {
+		return planReject(badRequest())
 	}
 
 	// Skew upper bound is server-clock-only — reject early, before any DB work.
@@ -202,12 +275,9 @@ func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, receiv
 	pending := make([]store.PendingLeaf, 0, len(leaves))
 	volatile := make(map[string]any, 8)
 	for _, lf := range leaves {
-		if len(lf.Path) > cfg.MaxPathLen {
-			return planReject(oversized("path-length"))
-		}
 		raw, err := json.Marshal(lf.Value)
 		if err != nil {
-			return planReject(wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest)
+			return planReject(badRequest())
 		}
 		if len(raw) > cfg.MaxValueBytes {
 			return planReject(oversized("value-bytes"))
@@ -223,11 +293,20 @@ func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, receiv
 		return planReject(internalErr())
 	}
 
+	// Tombstone gate: only a clean pass that actually carries durable leaves may
+	// tombstone absent ones. A clean push that flattens to ZERO durable leaves
+	// (e.g. an over-broad volatile policy that classifies every fact volatile, or
+	// a discovery malfunction) would otherwise close the Node's entire durable
+	// history — the same "evidence of nothing" hazard as an empty tree, at durable
+	// granularity. Carry the durable side forward instead (the volatile blob still
+	// applies); the discovery-clean signal for the dirty-streak alarm is separate.
 	return &pushPlan{
 		producerTS: producerTS,
+		received:   received,
+		maxSkew:    cfg.MaxSkew.D(),
 		pending:    pending,
 		volBlob:    volBlob,
-		clean:      push.Discovery.Clean(),
+		clean:      push.Discovery.Clean() && len(pending) > 0,
 	}, wire.PushResponse{}, 0
 }
 
@@ -250,17 +329,25 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 	}
 
 	// The per-node intern + serialized atomic transaction (and the ordering
-	// invariant that keeps it deadlock-free) live in the store.
-	stats, err := s.store.ApplySnapshot(ctx, certname, received, pl.producerTS, pl.pending, pl.volBlob, pl.clean)
+	// invariant that keeps it deadlock-free) live in the store. The receive time
+	// and skew bound let the store enforce the first-contact past bound under the
+	// lock, where the watermark state is authoritative.
+	stats, err := s.store.ApplySnapshot(ctx, certname, pl.received, pl.producerTS, pl.maxSkew, pl.pending, pl.volBlob, pl.clean)
 	switch {
 	case errors.Is(err, store.ErrDeactivated):
 		return wire.PushResponse{Reason: wire.ReasonDeactivated}, http.StatusForbidden
 	case errors.Is(err, store.ErrStale):
 		return wire.PushResponse{Reason: wire.ReasonStale}, http.StatusConflict
+	case errors.Is(err, store.ErrSkewed):
+		return wire.PushResponse{Reason: wire.ReasonSkewed}, http.StatusConflict
 	case err != nil:
 		s.log.Error("apply snapshot", "certname", certname, "err", err)
 		return internalErr()
 	}
+
+	// The streak tracks DISCOVERY-dirty passes (a source erred), not the apply
+	// tombstone gate (pl.clean, which also drops to false on a zero-durable push).
+	s.recordDirtyStreak(certname, push.Discovery.Clean(), push.Discovery.FailingSources())
 
 	return wire.PushResponse{
 		Applied:    true,
@@ -269,6 +356,48 @@ func (s *Service) Apply(ctx context.Context, certname string, push *wire.Push, r
 		Tombstoned: stats.Tombstoned,
 		Unchanged:  stats.Unchanged,
 	}, http.StatusOK
+}
+
+// recordDirtyStreak tracks per-node consecutive discovery-dirty applied passes
+// (task 5.2). A clean pass resets the streak; a dirty pass extends it. Crossing
+// the configured threshold logs once (naming the failing sources) and bumps the
+// over-threshold gauge, so an operator can see that the carry-forward gate has
+// frozen a node's tombstones rather than that condition staying silent forever.
+// ponytail: the streak is a best-effort alarm. The bookkeeping runs after the
+// apply commits, so two concurrent applies for one certname could miscount by
+// one — acceptable: applies are DB-serialized and per-certname rate-limited, so
+// it is rare and self-heals on the next pass.
+func (s *Service) recordDirtyStreak(certname string, clean bool, failing []string) {
+	threshold := s.cfg.DirtyStreakThreshold
+	if threshold <= 0 {
+		return // misconfigured (validate() enforces > 0); never drive the gauge negative
+	}
+	s.streakMu.Lock()
+	crossed := false
+	switch {
+	case clean:
+		if s.dirtyStreak[certname] >= threshold {
+			s.dirtyOver--
+		}
+		delete(s.dirtyStreak, certname)
+	default:
+		s.dirtyStreak[certname]++
+		if s.dirtyStreak[certname] == threshold {
+			s.dirtyOver++
+			crossed = true
+		}
+	}
+	streak := s.dirtyStreak[certname]
+	if s.metrics != nil {
+		// Set under the lock so the exported gauge cannot lag the protected state.
+		s.metrics.DirtyNodes.Set(float64(s.dirtyOver))
+	}
+	s.streakMu.Unlock()
+
+	if crossed {
+		s.log.Warn("node dirty streak crossed threshold; carry-forward gate is freezing tombstones",
+			"certname", certname, "streak", streak, "failing_sources", failing)
+	}
 }
 
 // allow consults (and lazily creates) the per-certname rate limiter.
@@ -322,6 +451,10 @@ func decodeTree(raw json.RawMessage) (map[string]any, error) {
 
 func oversized(which string) (wire.PushResponse, int) {
 	return wire.PushResponse{Reason: wire.ReasonOversized + ": " + which}, http.StatusRequestEntityTooLarge
+}
+
+func badRequest() (wire.PushResponse, int) {
+	return wire.PushResponse{Reason: wire.ReasonBadRequest}, http.StatusBadRequest
 }
 
 func internalErr() (wire.PushResponse, int) {

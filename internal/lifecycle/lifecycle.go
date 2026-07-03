@@ -47,8 +47,3 @@ func (m *Manager) Run(ctx context.Context, interval time.Duration) {
 		}
 	})
 }
-
-// Deactivate sunsets a node (terminal). Returns the seal time.
-func (m *Manager) Deactivate(ctx context.Context, certname string) (time.Time, error) {
-	return m.store.Deactivate(ctx, certname)
-}

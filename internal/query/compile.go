@@ -20,7 +20,6 @@ type GroupCount struct {
 
 // Result is a DSL query result; exactly one of Nodes/Groups is set per Shape.
 type Result struct {
-	Shape  Shape        `json:"-"`
 	Nodes  []string     `json:"nodes,omitempty"`
 	Groups []GroupCount `json:"groups,omitempty"`
 }
@@ -49,7 +48,7 @@ func (e *Engine) Run(ctx context.Context, q *Query, includeInactive bool) (*Resu
 		return nil, err
 	}
 	if empty { // a term/group references an unknown path -> no node can match
-		return &Result{Shape: q.Shape}, nil
+		return &Result{}, nil
 	}
 	switch q.Shape {
 	case ShapeFilter:
@@ -234,7 +233,7 @@ func (e *Engine) execFilter(ctx context.Context, sql string, args []any) (*Resul
 		return nil, err
 	}
 	defer rows.Close()
-	res := &Result{Shape: ShapeFilter}
+	res := &Result{}
 	for rows.Next() {
 		var cn string
 		if err := rows.Scan(&cn); err != nil {
@@ -251,7 +250,7 @@ func (e *Engine) execGroupBy(ctx context.Context, sql string, args []any) (*Resu
 		return nil, err
 	}
 	defer rows.Close()
-	res := &Result{Shape: ShapeGroupBy}
+	res := &Result{}
 	for rows.Next() {
 		var g GroupCount
 		if err := rows.Scan(&g.Value, &g.Count); err != nil {

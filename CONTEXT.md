@@ -49,12 +49,21 @@ The configured set of glob patterns that classifies each Fact path as Volatile (
 Durable (the default). Lives in `internal/classify` as `classify.Policy`; shared by ingest
 (write-side classification) and query (read-side routing and at-T rejection), and hot-reloaded
 on SIGHUP so the two endpoints never disagree.
+_Limitation_: reclassifying a Fact from Durable to Volatile closes its open durable interval on
+the next pass; in `fact_history` that close is indistinguishable from a genuine removal (there is
+no reclassification close-reason). This is an accepted v1 trade-off — reclassification is a rare
+operator action, documented here rather than modeled with an extra column.
 _Avoid_: filter, rules
 
 **Source**:
 The resolver or external script that produces a Fact (e.g. the `networking` resolver, or an
-external `rpm_packages.sh` script). Chronicle records each Fact's Source so it can tell a
-genuine removal from a transient discovery failure.
+external `rpm_packages.sh` script). In v1 Chronicle records a per-source, per-pass *discovery
+report* — each source is `ok`/`error` for the whole pass — not a per-Fact Source. A clean pass
+(no source error) makes every absent Durable fact tombstone-eligible; any source error carries
+the whole pass forward instead (the carry-forward gate, ADR-0009 §1). Per-leaf Source
+provenance — attributing an individual missing leaf to the specific source that failed — is
+deferred-with-trigger on the upstream `facts` API; the per-node dirty-streak alarm is the v1
+mitigation so a permanently dirty source can't silently freeze a Node's tombstones forever.
 
 **Tombstone**:
 The closing of a Durable fact's open interval because the Fact was genuinely removed from a

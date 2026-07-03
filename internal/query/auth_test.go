@@ -12,8 +12,11 @@ import (
 
 func TestStaticTokenRolesAndRejection(t *testing.T) {
 	cfg := &config.ServerConfig{
-		StaticTokens: map[string]string{"r-tok": "reader", "a-tok": "admin"},
-		OIDC:         config.OIDC{RolesClaim: "groups"}, // no Issuer => no JWT verifier
+		StaticTokens: []config.StaticToken{
+			{Name: "reader-bot", Token: "r-tok", Role: "reader"},
+			{Name: "admin-op", Token: "a-tok", Role: "admin"},
+		},
+		OIDC: config.OIDC{RolesClaim: "groups"}, // no Issuer => no JWT verifier
 	}
 	auth, err := NewAuthenticator(context.Background(), cfg)
 	if err != nil {
@@ -28,16 +31,16 @@ func TestStaticTokenRolesAndRejection(t *testing.T) {
 		return r
 	}
 
-	if role, err := auth.Authenticate(context.Background(), req("r-tok")); err != nil || role != RoleReader {
-		t.Fatalf("reader token => %v %v", role, err)
+	if role, who, err := auth.Authenticate(context.Background(), req("r-tok")); err != nil || role != RoleReader || who != "reader-bot" {
+		t.Fatalf("reader token => role=%v who=%q err=%v", role, who, err)
 	}
-	if role, err := auth.Authenticate(context.Background(), req("a-tok")); err != nil || role != RoleAdmin {
-		t.Fatalf("admin token => %v %v", role, err)
+	if role, who, err := auth.Authenticate(context.Background(), req("a-tok")); err != nil || role != RoleAdmin || who != "admin-op" {
+		t.Fatalf("admin token => role=%v who=%q err=%v", role, who, err)
 	}
-	if _, err := auth.Authenticate(context.Background(), req("")); err == nil {
+	if _, _, err := auth.Authenticate(context.Background(), req("")); err == nil {
 		t.Fatal("missing token must error")
 	}
-	if _, err := auth.Authenticate(context.Background(), req("bogus")); err == nil {
+	if _, _, err := auth.Authenticate(context.Background(), req("bogus")); err == nil {
 		t.Fatal("invalid token must error")
 	}
 }

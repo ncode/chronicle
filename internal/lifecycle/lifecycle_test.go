@@ -23,7 +23,7 @@ func setup(t *testing.T) (*store.Store, *ingest.Service, *Manager, context.Conte
 		t.Skip("set CHRONICLE_TEST_DB to run lifecycle integration tests")
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,6 +55,7 @@ func push(t *testing.T, svc *ingest.Service, ctx context.Context, certname, tree
 	t.Helper()
 	return svc.Apply(ctx, certname, &wire.Push{
 		ProducerTimestamp: ts, Tree: json.RawMessage(tree),
+		Discovery: wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}}, // non-degenerate clean report
 	}, received)
 }
 
@@ -115,13 +116,13 @@ func TestExpiryRoundTrip(t *testing.T) {
 }
 
 func TestDeactivationSealsAndRejects(t *testing.T) {
-	st, svc, mgr, ctx := setup(t)
+	st, svc, _, ctx := setup(t)
 	wipe(t, st, ctx, "sunset.node")
 
 	push(t, svc, ctx, "sunset.node", `{"os":{"name":"Debian"}}`, lt1, lt1)
 	id, _, _ := st.NodeID(ctx, "sunset.node")
 
-	if _, err := mgr.Deactivate(ctx, "sunset.node"); err != nil {
+	if _, err := st.Deactivate(ctx, "sunset.node"); err != nil {
 		t.Fatal(err)
 	}
 	// Timeline sealed: nothing current.

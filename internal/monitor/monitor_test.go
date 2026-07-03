@@ -20,7 +20,7 @@ func setup(t *testing.T) (*Monitor, *store.Store, context.Context) {
 		t.Skip("set CHRONICLE_TEST_DB to run monitor integration tests")
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,7 +46,7 @@ func applyAt(t *testing.T, st *store.Store, ctx context.Context, certname string
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	node, err := st.LockNode(ctx, tx, certname)
+	node, _, err := st.LockNode(ctx, tx, certname)
 	if err != nil {
 		t.Fatal(err)
 	}
