@@ -702,14 +702,17 @@ func (s *Store) Diff(ctx context.Context, nodeID int64, t1, t2 time.Time) ([]Dif
 	return out, rows.Err()
 }
 
-type countRow struct {
+// CountRow is one (key, count) result from the monitor scans — a path and its
+// interval-open count for HighChurn, a certname and its distinct-path count for
+// FactPathCardinality.
+type CountRow struct {
 	Key   string
 	Count int64
 }
 
 // HighChurn returns durable paths that opened at least threshold intervals
 // since the caller-computed lower bound.
-func (s *Store) HighChurn(ctx context.Context, since time.Time, threshold int64) ([]countRow, error) {
+func (s *Store) HighChurn(ctx context.Context, since time.Time, threshold int64) ([]CountRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT fp.path_text, count(*) AS opens
 		FROM   fact_history fh JOIN fact_paths fp USING (path_id)
@@ -726,7 +729,7 @@ func (s *Store) HighChurn(ctx context.Context, since time.Time, threshold int64)
 
 // FactPathCardinality returns nodes with at least threshold distinct durable
 // fact paths.
-func (s *Store) FactPathCardinality(ctx context.Context, threshold int64) ([]countRow, error) {
+func (s *Store) FactPathCardinality(ctx context.Context, threshold int64) ([]CountRow, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT n.certname, count(DISTINCT fh.path_id) AS paths
 		FROM   fact_history fh JOIN nodes n USING (node_id)
@@ -740,11 +743,11 @@ func (s *Store) FactPathCardinality(ctx context.Context, threshold int64) ([]cou
 	return scanCountRows(rows)
 }
 
-func scanCountRows(rows pgx.Rows) ([]countRow, error) {
+func scanCountRows(rows pgx.Rows) ([]CountRow, error) {
 	defer rows.Close()
-	var out []countRow
+	var out []CountRow
 	for rows.Next() {
-		var r countRow
+		var r CountRow
 		if err := rows.Scan(&r.Key, &r.Count); err != nil {
 			return nil, err
 		}

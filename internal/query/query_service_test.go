@@ -160,13 +160,16 @@ func TestQueryEndpointMapsErrors(t *testing.T) {
 		{"missing q", "/v1/query", 400, ""},
 		{"unparsable DSL", "/v1/query?q=role", 400, ""},
 		{"oversized DSL", "/v1/query?q=" + strings.Repeat("a", maxDSLLen+1), 413, ""},
+		// Exactly at the cap is NOT oversized: it falls through to the parser,
+		// which rejects the gibberish with 400 (pins the > vs >= boundary).
+		{"DSL exactly at cap", "/v1/query?q=" + strings.Repeat("a", maxDSLLen), 400, ""},
 		{"volatile at past", "/v1/query?q=" + url.QueryEscape("uptime=123 at 2026-01-01T09:00:00Z"), 422, ErrNoHistory.Error()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := serveRead(t, h, http.MethodGet, tt.path, "r-tok")
 			if w.Code != tt.want {
-				t.Fatalf("%s = %d, want %d", tt.name, w.Code, tt.want)
+				t.Fatalf("%s = %d, want %d (body: %s)", tt.name, w.Code, tt.want, w.Body.String())
 			}
 			if tt.wantErrText == "" {
 				return
@@ -249,6 +252,16 @@ func TestResetWatermarkEndToEnd(t *testing.T) {
 
 	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
+
+	// A reader's attempt is refused AND leaves the poisoned watermark in place:
+	// the same stale push must still be rejected (spec: "last_producer_ts is
+	// unchanged").
+	if code := httpPost(t, srv.URL, "/v1/admin/reset-watermark?certname="+url.QueryEscape(certname), "r-tok"); code != 403 {
+		t.Fatalf("reader reset-watermark = %d, want 403", code)
+	}
+	if status, body := httpPush(t, ing, certname, push(`{"os":{"name":"B"}}`, normalTS)); status != 409 || body["reason"] != wire.ReasonStale {
+		t.Fatalf("push after reader 403 = %d %+v, want 409 stale (watermark must be untouched)", status, body)
+	}
 
 	if code := httpPost(t, srv.URL, "/v1/admin/reset-watermark?certname="+url.QueryEscape(certname), "a-tok"); code != 200 {
 		t.Fatalf("admin reset-watermark = %d, want 200", code)

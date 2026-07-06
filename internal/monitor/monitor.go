@@ -64,26 +64,22 @@ func (m *Monitor) Run(ctx context.Context, interval time.Duration) {
 // forward-only reclassification: add the path to the Volatile policy.
 func (m *Monitor) CheckChurn(ctx context.Context) ([]Finding, error) {
 	rows, err := m.store.HighChurn(ctx, time.Now().Add(-m.churnWindow), m.churnThreshold)
-	if err != nil {
-		return nil, err
-	}
+	// Partial rows before a mid-scan error are still findings — keep them
+	// alongside the error so Run logs what was seen.
 	var out []Finding
 	for _, r := range rows {
 		out = append(out, Finding{Key: r.Key, Count: r.Count})
 	}
-	return out, nil
+	return out, err
 }
 
 // CheckCardinality flags nodes whose distinct fact_paths count is abnormally
 // high — one authenticated node trying to bloat the shared dictionary.
 func (m *Monitor) CheckCardinality(ctx context.Context) ([]Finding, error) {
 	rows, err := m.store.FactPathCardinality(ctx, m.cardThreshold)
-	if err != nil {
-		return nil, err
-	}
 	var out []Finding
 	for _, r := range rows {
 		out = append(out, Finding{Key: r.Key, Count: r.Count})
 	}
-	return out, nil
+	return out, err
 }
