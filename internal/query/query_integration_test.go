@@ -51,32 +51,21 @@ var (
 // so omitted facts would tombstone — always pass the complete desired set).
 func seed(t *testing.T, st *store.Store, ctx context.Context, certname string, at time.Time, facts map[string]any) {
 	t.Helper()
-	tx, err := st.Pool().Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
-	node, _, err := st.LockNode(ctx, tx, certname)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var leaves []store.DurableLeaf
+	seedSnapshot(t, st, ctx, certname, at, facts, json.RawMessage(`{}`))
+}
+
+func seedSnapshot(t *testing.T, st *store.Store, ctx context.Context, certname string, at time.Time, facts map[string]any, vol json.RawMessage) {
+	t.Helper()
+	leaves := make([]store.PendingLeaf, 0, len(facts))
 	for path, v := range facts {
 		name, _, _ := strings.Cut(path, ".")
-		pid, err := st.InternPath(ctx, path, name)
+		raw, err := json.Marshal(v)
 		if err != nil {
 			t.Fatal(err)
 		}
-		raw, _ := json.Marshal(v)
-		leaves = append(leaves, store.DurableLeaf{PathID: pid, Value: raw, Hash: store.ValueHash(v)})
+		leaves = append(leaves, store.PendingLeaf{Path: path, FactName: name, Value: raw, Hash: store.ValueHash(v)})
 	}
-	if _, err := st.ApplyDurable(ctx, tx, node.ID, leaves, at, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := st.MarkContact(ctx, tx, node.ID, at, &at); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
+	if _, err := st.ApplySnapshot(ctx, certname, at, at, 0, leaves, vol, true); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -153,23 +142,10 @@ func TestAtTimePointInTime(t *testing.T) {
 func TestVolatileRoutingAndNoHistory(t *testing.T) {
 	e, st, ctx := testEngine(t)
 	wipe(t, st, ctx, "qvol01")
-	seed(t, st, ctx, "qvol01", qt1, map[string]any{"role": "web"})
-	// Put a volatile value in node_volatile directly (committed immediately so
-	// the read on another pool connection sees it).
-	id, _, _ := st.NodeID(ctx, "qvol01")
-	tx, err := st.Pool().Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := st.UpsertVolatile(ctx, tx, id, json.RawMessage(`{"uptime":12345}`), qt1); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
+	seedSnapshot(t, st, ctx, "qvol01", qt1, map[string]any{"role": "web"}, json.RawMessage(`{"uptime":12345}`))
 
 	// at <past> on a volatile path => typed no-history error.
-	_, err = e.Run(ctx, mustParse(t, `uptime=12345 at 2026-01-01T09:00:00Z`), false)
+	_, err := e.Run(ctx, mustParse(t, `uptime=12345 at 2026-01-01T09:00:00Z`), false)
 	if !errors.Is(err, ErrNoHistory) {
 		t.Fatalf("volatile at-past => %v, want ErrNoHistory", err)
 	}

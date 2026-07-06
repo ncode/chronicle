@@ -52,7 +52,7 @@ func freshNode(t *testing.T, s *Store, ctx context.Context, certname string) int
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	n, _, err := s.LockNode(ctx, tx, certname)
+	n, _, err := s.lockNode(ctx, tx, certname)
 	if err != nil {
 		t.Fatalf("lock node: %v", err)
 	}
@@ -65,7 +65,7 @@ func freshNode(t *testing.T, s *Store, ctx context.Context, certname string) int
 func mkLeaf(t *testing.T, s *Store, ctx context.Context, path, jsonVal string) DurableLeaf {
 	t.Helper()
 	name, _, _ := strings.Cut(path, ".")
-	pid, err := s.InternPath(ctx, path, name)
+	pid, err := s.internPath(ctx, path, name)
 	if err != nil {
 		t.Fatalf("intern %q: %v", path, err)
 	}
@@ -84,7 +84,7 @@ func apply(t *testing.T, s *Store, ctx context.Context, nodeID int64, leaves []D
 		t.Fatal(err)
 	}
 	defer tx.Rollback(ctx)
-	st, err := s.ApplyDurable(ctx, tx, nodeID, leaves, at, clean)
+	st, err := s.applyDurable(ctx, tx, nodeID, leaves, at, clean)
 	if err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestCarryForwardOnDirtyDiscovery(t *testing.T) {
 func TestOpenIntervalIntegrityBoundary(t *testing.T) {
 	s, ctx := testStore(t)
 	node := freshNode(t, s, ctx, "integrity.example")
-	pid, err := s.InternPath(ctx, "os.name", "os")
+	pid, err := s.internPath(ctx, "os.name", "os")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +236,7 @@ func TestOpenIntervalIntegrityBoundary(t *testing.T) {
 func TestCheckConstraintRejectsInvertedInterval(t *testing.T) {
 	s, ctx := testStore(t)
 	node := freshNode(t, s, ctx, "check.example")
-	pid, err := s.InternPath(ctx, "os.name", "os")
+	pid, err := s.internPath(ctx, "os.name", "os")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -41,29 +41,16 @@ func setup(t *testing.T) (*Monitor, *store.Store, context.Context) {
 
 func applyAt(t *testing.T, st *store.Store, ctx context.Context, certname string, at time.Time, facts map[string]any) {
 	t.Helper()
-	tx, err := st.Pool().Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx)
-	node, _, err := st.LockNode(ctx, tx, certname)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var leaves []store.DurableLeaf
+	leaves := make([]store.PendingLeaf, 0, len(facts))
 	for path, v := range facts {
 		name, _, _ := strings.Cut(path, ".")
-		pid, err := st.InternPath(ctx, path, name)
+		raw, err := json.Marshal(v)
 		if err != nil {
 			t.Fatal(err)
 		}
-		raw, _ := json.Marshal(v)
-		leaves = append(leaves, store.DurableLeaf{PathID: pid, Value: raw, Hash: store.ValueHash(v)})
+		leaves = append(leaves, store.PendingLeaf{Path: path, FactName: name, Value: raw, Hash: store.ValueHash(v)})
 	}
-	if _, err := st.ApplyDurable(ctx, tx, node.ID, leaves, at, true); err != nil {
-		t.Fatal(err)
-	}
-	if err := tx.Commit(ctx); err != nil {
+	if _, err := st.ApplySnapshot(ctx, certname, at, at, 0, leaves, json.RawMessage(`{}`), true); err != nil {
 		t.Fatal(err)
 	}
 }
