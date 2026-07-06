@@ -26,7 +26,11 @@ jobs:
           - { name: Linux x64, os: ubuntu-latest }
           - { name: Linux arm64, os: ubuntu-24.04-arm }
           - { name: macOS arm64, os: macos-latest }
-          - { name: macOS x64, os: macos-13 }
+          # macos-13 (Intel) is deprecated and its free runner pool is starved,
+          # so jobs never get scheduled. GitHub's free macOS runners are all
+          # Apple Silicon now; darwin/amd64 stays covered by the cross-compile
+          # matrix. Use a second supported macOS version instead.
+          - { name: macOS 14, os: macos-14 }
           - { name: Windows Server 2022, os: windows-2022 }
           - { name: Windows Server 2025, os: windows-2025 }
     runs-on: ${{ matrix.os }}

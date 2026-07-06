@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 //go:embed migrations/*.sql
@@ -25,7 +27,11 @@ var migrationsFS embed.FS
 const migrateLockKey int64 = 0x6368726f6e696c31 // "chronicl1"
 
 func (s *Store) Migrate(ctx context.Context) error {
-	// Hold a session advisory lock on a dedicated connection for the whole run.
+	// Hold a session advisory lock on a dedicated connection for the whole run,
+	// and do ALL migration work on that one connection. Going back to the pool
+	// (e.g. s.pool.Exec) while holding this connection would self-deadlock at
+	// pool_max_conns=1: the lock winner would block waiting for a second conn the
+	// pool cannot hand out (ADR-0009 §5).
 	conn, err := s.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("acquire migration conn: %w", err)
@@ -36,7 +42,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	defer conn.Exec(ctx, `SELECT pg_advisory_unlock($1)`, migrateLockKey) //nolint:errcheck // best-effort
 
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := conn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			version    int         PRIMARY KEY,
 			applied_at timestamptz NOT NULL DEFAULT now()
@@ -50,7 +56,7 @@ func (s *Store) Migrate(ctx context.Context) error {
 	}
 	for _, m := range migs {
 		var exists bool
-		if err := s.pool.QueryRow(ctx,
+		if err := conn.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, m.version,
 		).Scan(&exists); err != nil {
 			return fmt.Errorf("check migration %d: %w", m.version, err)
@@ -58,15 +64,15 @@ func (s *Store) Migrate(ctx context.Context) error {
 		if exists {
 			continue
 		}
-		if err := s.applyOne(ctx, m); err != nil {
+		if err := applyOne(ctx, conn, m); err != nil {
 			return fmt.Errorf("apply migration %d (%s): %w", m.version, m.name, err)
 		}
 	}
 	return nil
 }
 
-func (s *Store) applyOne(ctx context.Context, m migration) error {
-	tx, err := s.pool.Begin(ctx)
+func applyOne(ctx context.Context, conn *pgxpool.Conn, m migration) error {
+	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
@@ -87,14 +93,23 @@ type migration struct {
 	sql     string
 }
 
-// loadMigrations reads the embedded migrations/*.sql files, parsing the leading
-// integer of each filename (NNNN_name.sql) as the version, sorted ascending.
+// loadMigrations reads the embedded migrations/*.sql files.
 func loadMigrations() ([]migration, error) {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	return loadMigrationsFS(migrationsFS, "migrations")
+}
+
+// loadMigrationsFS reads dir/*.sql from fsys, parsing the leading integer of
+// each filename (NNNN_name.sql) as the version, sorted ascending. Two files with
+// the same version number are a hard error (an ambiguous, silently-skipped
+// migration is worse than a failed startup). Split from loadMigrations so the
+// duplicate-version guard is testable with an in-memory FS.
+func loadMigrationsFS(fsys fs.FS, dir string) ([]migration, error) {
+	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
 		return nil, err
 	}
 	var migs []migration
+	seen := make(map[int]string)
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
 			continue
@@ -107,7 +122,11 @@ func loadMigrations() ([]migration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("migration %q has non-numeric version: %w", e.Name(), err)
 		}
-		b, err := migrationsFS.ReadFile("migrations/" + e.Name())
+		if prev, dup := seen[v]; dup {
+			return nil, fmt.Errorf("duplicate migration version %d: %q and %q", v, prev, e.Name())
+		}
+		seen[v] = e.Name()
+		b, err := fs.ReadFile(fsys, dir+"/"+e.Name())
 		if err != nil {
 			return nil, err
 		}

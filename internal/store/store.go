@@ -14,18 +14,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// DB is the subset of pgx satisfied by both *pgxpool.Pool and pgx.Tx, so the
-// same helper works inside or outside a transaction.
-type DB interface {
-	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
-	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
-	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}
 
 // Store wraps a pgx pool plus an in-process path-interning cache.
 type Store struct {
@@ -35,9 +26,19 @@ type Store struct {
 	pathCache map[string]int64 // path_text -> path_id
 }
 
-// Open dials Postgres and verifies connectivity.
-func Open(ctx context.Context, dsn string) (*Store, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// Open dials Postgres and verifies connectivity. maxConns caps the pool so the
+// backpressure bound and the migration runner's advisory-lock connection have a
+// known, validated ceiling (config.PoolMaxConns); a non-positive value keeps
+// pgx's default sizing.
+func Open(ctx context.Context, dsn string, maxConns int) (*Store, error) {
+	pcfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse postgres dsn: %w", err)
+	}
+	if maxConns > 0 {
+		pcfg.MaxConns = int32(maxConns)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
@@ -124,21 +125,27 @@ type Node struct {
 
 // LockNode creates the node on first contact and returns its row with a
 // FOR UPDATE lock held in tx, serializing concurrent pushes for one certname
-// (ADR-0009 §3). Identity is the verified cert CN; same CN = one history.
-func (s *Store) LockNode(ctx context.Context, tx pgx.Tx, certname string) (Node, error) {
-	if _, err := tx.Exec(ctx,
+// (ADR-0009 §3). Identity is the verified cert CN; same CN = one history. The
+// returned `inserted` is true only when this call created the row (genuine first
+// contact) — distinguishing a truly-new node from an existing one whose watermark
+// was cleared by ResetProducerTS, so the first-contact clock bound does not wedge
+// an operator's watermark-reset recovery.
+func (s *Store) LockNode(ctx context.Context, tx pgx.Tx, certname string) (Node, bool, error) {
+	ct, err := tx.Exec(ctx,
 		`INSERT INTO nodes (certname) VALUES ($1) ON CONFLICT (certname) DO NOTHING`,
-		certname); err != nil {
-		return Node{}, fmt.Errorf("ensure node %q: %w", certname, err)
+		certname)
+	if err != nil {
+		return Node{}, false, fmt.Errorf("ensure node %q: %w", certname, err)
 	}
+	inserted := ct.RowsAffected() == 1
 	n := Node{Certname: certname}
 	if err := tx.QueryRow(ctx,
 		`SELECT node_id, last_producer_ts, deactivated, expired
 		   FROM nodes WHERE certname = $1 FOR UPDATE`, certname,
 	).Scan(&n.ID, &n.LastProducerTS, &n.Deactivated, &n.Expired); err != nil {
-		return Node{}, fmt.Errorf("lock node %q: %w", certname, err)
+		return Node{}, false, fmt.Errorf("lock node %q: %w", certname, err)
 	}
-	return n, nil
+	return n, inserted, nil
 }
 
 // PeekNode reads a node's guard-relevant state without creating or locking it,
@@ -171,6 +178,18 @@ func (s *Store) MarkContact(ctx context.Context, tx pgx.Tx, nodeID int64, now ti
 	return err
 }
 
+// TouchContact advances last_seen for a non-deactivated node WITHOUT applying a
+// snapshot, so an authenticated push that was rejected (stale watermark, skew,
+// bad request, collision, cap) still registers contact and the node is not
+// falsely swept as Expired (ADR-0011, node-lifecycle spec). It runs on the pool
+// (autocommit), off the per-node apply tx. It does NOT clear `expired` — only an
+// applied push un-expires — and no-ops for an unknown or deactivated certname.
+func (s *Store) TouchContact(ctx context.Context, certname string) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE nodes SET last_seen = now() WHERE certname = $1 AND deactivated IS NULL`, certname)
+	return err
+}
+
 // ErrNodeNotFound is returned by operator actions for an unknown certname.
 var ErrNodeNotFound = errors.New("node not found")
 
@@ -179,11 +198,14 @@ var ErrNodeNotFound = errors.New("node not found")
 // interval. Ingest maps it to a stale reject (not a 500).
 var ErrStaleApply = errors.New("producer_timestamp not after newest stored interval")
 
-// ErrDeactivated and ErrStale are the per-node guard rejections ApplySnapshot
-// returns, so the caller maps them to typed responses without touching SQL.
+// ErrDeactivated, ErrStale, and ErrSkewed are the per-node guard rejections
+// ApplySnapshot returns, so the caller maps them to typed responses without
+// touching SQL. ErrSkewed is the first-contact past bound (a node with no
+// watermark cannot backdate history beyond received_at - max_skew).
 var (
 	ErrDeactivated = errors.New("node deactivated")
 	ErrStale       = errors.New("stale push")
+	ErrSkewed      = errors.New("skewed push")
 )
 
 // ResetProducerTS clears a node's last_producer_ts so subsequent in-bounds
@@ -302,14 +324,31 @@ func (s *Store) ApplyDurable(ctx context.Context, tx pgx.Tx, nodeID int64, leave
 	if err != nil {
 		return stats, err
 	}
+	maxClosedValidTo, err := s.maxClosedValidTo(ctx, tx, nodeID)
+	if err != nil {
+		return stats, err
+	}
 
-	// Reject a push that is not strictly newer than the node's newest stored
-	// interval: closing at t <= an open interval's valid_from would write
-	// valid_to <= valid_from and trip CHECK (valid_from < valid_to). Normally the
-	// caller's stale guard already ensures t is past last_producer_ts (>= every
-	// valid_from); this also covers a watermark cleared by ResetProducerTS on a
-	// node whose open intervals carry a far-future valid_from.
+	// Reject a push whose observation time would overlap the node's stored
+	// history (ADR-0003 no-overlap invariant). Two bounds, both required:
+	//
+	//   1. t must be strictly after every OPEN interval's valid_from, or closing
+	//      one at t would write valid_to <= valid_from and trip
+	//      CHECK (valid_from < valid_to).
+	//   2. t must be at or after every CLOSED interval's valid_to, or a new
+	//      interval opened at t would overlap an already-closed one — two
+	//      conflicting values at the same instant. Equality is allowed: intervals
+	//      are half-open [valid_from, valid_to), so opening exactly at a closed
+	//      valid_to is adjacent, not overlapping.
+	//
+	// Normally the caller's watermark guard already ensures t is past
+	// last_producer_ts. This also covers a watermark cleared by ResetProducerTS on
+	// a node whose closed history extends past the reset point (post-reset past
+	// push after a full tombstone pass).
 	if len(open) > 0 && !t.After(maxValidFrom) {
+		return stats, ErrStaleApply
+	}
+	if !maxClosedValidTo.IsZero() && t.Before(maxClosedValidTo) {
 		return stats, ErrStaleApply
 	}
 
@@ -410,6 +449,23 @@ func (s *Store) openHashes(ctx context.Context, tx pgx.Tx, nodeID int64) (map[in
 	return open, maxValidFrom, rows.Err()
 }
 
+// maxClosedValidTo returns the greatest valid_to among the node's CLOSED
+// intervals (valid_to <> 'infinity'), or the zero time when the node has none.
+// It backs the overlap guard's second bound: a new interval must not open before
+// the newest closed interval's end. Served by fact_history_node_closed_idx.
+func (s *Store) maxClosedValidTo(ctx context.Context, tx pgx.Tx, nodeID int64) (time.Time, error) {
+	var vt pgtype.Timestamptz
+	if err := tx.QueryRow(ctx,
+		`SELECT max(valid_to) FROM fact_history
+		  WHERE node_id = $1 AND valid_to <> 'infinity'`, nodeID).Scan(&vt); err != nil {
+		return time.Time{}, fmt.Errorf("read max closed valid_to: %w", err)
+	}
+	if !vt.Valid { // no closed intervals -> SQL NULL
+		return time.Time{}, nil
+	}
+	return vt.Time, nil
+}
+
 // ── Volatile apply (task 2.5) ────────────────────────────────────────────────
 
 // UpsertVolatile overwrites the node's single latest-only volatile blob.
@@ -453,15 +509,22 @@ type PendingLeaf struct {
 //
 // Returns ErrDeactivated / ErrStale for the guard rejections; any other error is
 // an internal failure with the failing step wrapped.
-func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, producerTS time.Time, pending []PendingLeaf, volBlob json.RawMessage, clean bool) (ApplyStats, error) {
+func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, producerTS time.Time, maxSkew time.Duration, pending []PendingLeaf, volBlob json.RawMessage, clean bool) (ApplyStats, error) {
 	// Cheap non-locking pre-check before interning (the authoritative guards
-	// re-run under the lock below).
-	if peek, ok, err := s.PeekNode(ctx, certname); err == nil && ok {
-		if peek.Deactivated != nil {
+	// re-run under the lock below). It also rejects a far-past first-contact push
+	// here, BEFORE interning, so a backdated push cannot grow the shared
+	// never-GC'd fact_paths dictionary with orphaned paths (its node row would be
+	// rolled back, leaving the interned paths invisible to the cardinality alarm).
+	if peek, ok, err := s.PeekNode(ctx, certname); err == nil {
+		switch {
+		case ok && peek.Deactivated != nil:
 			return ApplyStats{}, ErrDeactivated
-		}
-		if peek.LastProducerTS != nil && !producerTS.After(*peek.LastProducerTS) {
+		case ok && peek.LastProducerTS != nil && !producerTS.After(*peek.LastProducerTS):
 			return ApplyStats{}, ErrStale
+		case !ok && producerTS.Before(received.Add(-maxSkew)):
+			// Node does not exist yet: apparent first contact. The locked guard
+			// (keyed on the authoritative `inserted`) is the backstop for a race.
+			return ApplyStats{}, ErrSkewed
 		}
 	}
 
@@ -482,7 +545,7 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	node, err := s.LockNode(ctx, tx, certname)
+	node, inserted, err := s.LockNode(ctx, tx, certname)
 	if err != nil {
 		return ApplyStats{}, fmt.Errorf("lock node: %w", err)
 	}
@@ -491,6 +554,17 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 	}
 	if node.LastProducerTS != nil && !producerTS.After(*node.LastProducerTS) {
 		return ApplyStats{}, ErrStale
+	}
+	// First-contact past bound (task 2.1): a genuinely new node with a
+	// reset/skewed clock could otherwise backdate arbitrarily old history at
+	// fleet-wide at-T queries. Keyed on the authoritative `inserted` (this call
+	// created the row) — NOT on a nil watermark, which is also true after an
+	// operator ResetProducerTS, so a watermark-reset recovery push is not wedged.
+	// Rolls back cleanly (the LockNode INSERT is undone with the tx), so a
+	// rejected first push persists no node row. Delayed non-first-contact pushes
+	// are unaffected (bounded by the watermark / the overlap guard).
+	if inserted && producerTS.Before(received.Add(-maxSkew)) {
+		return ApplyStats{}, ErrSkewed
 	}
 
 	stats, err := s.ApplyDurable(ctx, tx, node.ID, durable, producerTS, clean)
@@ -517,7 +591,6 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 // FactRow is one reconstructed Durable fact. Open is true for the current value
 // (valid_to = 'infinity'); ValidTo is meaningful only when Open is false.
 type FactRow struct {
-	PathID    int64           `json:"-"`
 	Path      string          `json:"path"`
 	FactName  string          `json:"fact_name"`
 	Value     json.RawMessage `json:"value"`
@@ -529,7 +602,7 @@ type FactRow struct {
 // Now returns a node's current Durable facts (open intervals).
 func (s *Store) Now(ctx context.Context, nodeID int64) ([]FactRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT path_id, path_text, fact_name, value, valid_from, 'infinity'::timestamptz
+		`SELECT path_text, fact_name, value, valid_from, 'infinity'::timestamptz
 		   FROM current_facts WHERE node_id = $1 ORDER BY path_text`, nodeID)
 	if err != nil {
 		return nil, err
@@ -537,10 +610,28 @@ func (s *Store) Now(ctx context.Context, nodeID int64) ([]FactRow, error) {
 	return scanFacts(rows)
 }
 
+// Volatile returns a node's latest-only volatile blob and its observation time.
+// ok is false when the node has never pushed a volatile blob. Volatile facts are
+// current-only (ADR-0007), so there is no at-T variant.
+func (s *Store) Volatile(ctx context.Context, nodeID int64) (json.RawMessage, time.Time, bool, error) {
+	var blob json.RawMessage
+	var observedAt time.Time
+	err := s.pool.QueryRow(ctx,
+		`SELECT volatile, observed_at FROM node_volatile WHERE node_id = $1`, nodeID).
+		Scan(&blob, &observedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, time.Time{}, false, nil
+	}
+	if err != nil {
+		return nil, time.Time{}, false, err
+	}
+	return blob, observedAt, true, nil
+}
+
 // StateAt reconstructs a node's Durable facts as of time t.
 func (s *Store) StateAt(ctx context.Context, nodeID int64, t time.Time) ([]FactRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT path_id, path_text, fact_name, value, valid_from, valid_to
+		`SELECT path_text, fact_name, value, valid_from, valid_to
 		   FROM node_state_at($1, $2) ORDER BY path_text`, nodeID, t)
 	if err != nil {
 		return nil, err
@@ -554,7 +645,7 @@ func scanFacts(rows pgx.Rows) ([]FactRow, error) {
 	for rows.Next() {
 		var f FactRow
 		var vt pgtype.Timestamptz
-		if err := rows.Scan(&f.PathID, &f.Path, &f.FactName, &f.Value, &f.ValidFrom, &vt); err != nil {
+		if err := rows.Scan(&f.Path, &f.FactName, &f.Value, &f.ValidFrom, &vt); err != nil {
 			return nil, err
 		}
 		f.ValidTo, f.Open = closeTime(vt)
@@ -576,7 +667,6 @@ func closeTime(vt pgtype.Timestamptz) (time.Time, bool) {
 // deletion has ClosedInWindow true, OpenedInWindow false, Open false. Open is
 // true for an interval that opened in-window and is still current.
 type DiffRow struct {
-	PathID         int64           `json:"-"`
 	Path           string          `json:"path"`
 	FactName       string          `json:"fact_name"`
 	Value          json.RawMessage `json:"value"`
@@ -591,7 +681,7 @@ type DiffRow struct {
 // including tombstones (ADR-0003).
 func (s *Store) Diff(ctx context.Context, nodeID int64, t1, t2 time.Time) ([]DiffRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT path_id, path_text, fact_name, value, valid_from, valid_to,
+		`SELECT path_text, fact_name, value, valid_from, valid_to,
 		        opened_in_window, closed_in_window
 		   FROM node_diff($1, $2, $3) ORDER BY path_text, valid_from`, nodeID, t1, t2)
 	if err != nil {
@@ -602,7 +692,7 @@ func (s *Store) Diff(ctx context.Context, nodeID int64, t1, t2 time.Time) ([]Dif
 	for rows.Next() {
 		var d DiffRow
 		var vt pgtype.Timestamptz
-		if err := rows.Scan(&d.PathID, &d.Path, &d.FactName, &d.Value,
+		if err := rows.Scan(&d.Path, &d.FactName, &d.Value,
 			&d.ValidFrom, &vt, &d.OpenedInWindow, &d.ClosedInWindow); err != nil {
 			return nil, err
 		}

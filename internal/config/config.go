@@ -64,6 +64,10 @@ type ServerConfig struct {
 	MaxValueBytes   int      `json:"max_value_bytes"`    // hard cap on a single leaf value
 	RateLimitPerMin int      `json:"rate_limit_per_min"` // per-certname push rate limit
 	MaxConcurrent   int      `json:"max_concurrent"`     // bounded ingest concurrency (backpressure)
+	PoolMaxConns    int      `json:"pool_max_conns"`     // pgx pool size; must exceed MaxConcurrent + headroom
+
+	// Observability (ADR-0009 §1).
+	DirtyStreakThreshold int `json:"dirty_streak_threshold"` // alarm after N consecutive dirty passes
 
 	// Durable/Volatile classification (ADR-0007). Glob patterns over leaf paths.
 	VolatilePaths []string `json:"volatile_paths"`
@@ -71,18 +75,28 @@ type ServerConfig struct {
 	// Lifecycle (ADR-0011).
 	ExpiryTTL Duration `json:"expiry_ttl"` // mark expired after this long with no contact
 
-	// People auth (ADR-0010). OIDC relying-party + static tokens.
-	OIDC         OIDC              `json:"oidc"`
-	StaticTokens map[string]string `json:"static_tokens"` // token -> role ("reader"|"admin")
+	// People auth (ADR-0010). OIDC relying-party + named static tokens.
+	OIDC           OIDC          `json:"oidc"`
+	StaticTokens   []StaticToken `json:"static_tokens"`     // named tokens (audit-attributable)
+	AuthFailPerMin int           `json:"auth_fail_per_min"` // per-source failed-auth rate limit
 
 	Log Log `json:"log"`
 }
 
+// StaticToken is a named bearer credential for people/automation reads. The name
+// (not the secret) is the audit principal, so an admin action can be attributed
+// to an operator of record without ever logging the token itself.
+type StaticToken struct {
+	Name  string `json:"name"`  // operator-assigned principal name (logged; never the secret)
+	Token string `json:"token"` // the bearer secret
+	Role  string `json:"role"`  // "reader" | "admin"
+}
+
 // OIDC configures chronicle as a relying party validating JWTs against the
-// company IdP's JWKS and mapping a groups/roles claim to reader/admin.
+// company IdP's JWKS and mapping a groups/roles claim to reader/admin. JWKS is
+// discovered from the issuer (go-oidc), so no explicit JWKS URL is configured.
 type OIDC struct {
 	Issuer      string   `json:"issuer"`
-	JWKSURL     string   `json:"jwks_url"`
 	Audience    string   `json:"audience"`
 	RolesClaim  string   `json:"roles_claim"` // claim holding groups/roles (default "groups")
 	AdminGroups []string `json:"admin_groups"`
@@ -150,6 +164,11 @@ func LoadAgent(path string) (*AgentConfig, error) {
 	return c, nil
 }
 
+// poolHeadroom is the number of pool connections reserved for non-ingest work
+// (read/admin queries, the lifecycle sweep, the monitor, and the migration
+// runner's advisory-lock connection) on top of MaxConcurrent apply transactions.
+const poolHeadroom = 8
+
 // validate rejects values that would panic or invert a guard. Defaults only
 // replace exact zeros, so an explicit negative would otherwise slip through.
 func (c *ServerConfig) validate() error {
@@ -165,11 +184,43 @@ func (c *ServerConfig) validate() error {
 		{"max_value_bytes", c.MaxValueBytes > 0},
 		{"max_skew", c.MaxSkew.D() > 0},
 		{"expiry_ttl", c.ExpiryTTL.D() > 0},
+		{"pool_max_conns", c.PoolMaxConns > 0},
+		{"dirty_streak_threshold", c.DirtyStreakThreshold > 0},
+		{"auth_fail_per_min", c.AuthFailPerMin > 0},
 	}
 	for _, ck := range checks {
 		if !ck.ok {
 			return fmt.Errorf("config: %s must be positive", ck.name)
 		}
+	}
+	// The pool must serve every concurrent apply transaction plus non-ingest
+	// headroom, or a saturated ingest starves reads/lifecycle and the migration
+	// runner can self-deadlock (ADR-0009 §5).
+	if c.MaxConcurrent+poolHeadroom > c.PoolMaxConns {
+		return fmt.Errorf("config: pool_max_conns (%d) must be at least max_concurrent + %d = %d",
+			c.PoolMaxConns, poolHeadroom, c.MaxConcurrent+poolHeadroom)
+	}
+	seenNames := make(map[string]int, len(c.StaticTokens))
+	seenTokens := make(map[string]int, len(c.StaticTokens))
+	for i, t := range c.StaticTokens {
+		switch {
+		case t.Name == "":
+			return fmt.Errorf("config: static_tokens[%d] must have a name", i)
+		case t.Token == "":
+			return fmt.Errorf("config: static token %q must have a token", t.Name)
+		case t.Role != "reader" && t.Role != "admin":
+			return fmt.Errorf("config: static token %q role must be reader or admin, got %q", t.Name, t.Role)
+		}
+		// Duplicate names make audit attribution ambiguous; duplicate secrets
+		// silently collapse to whichever entry is last (a role/principal footgun).
+		if prev, dup := seenNames[t.Name]; dup {
+			return fmt.Errorf("config: static token name %q duplicated at indexes %d and %d", t.Name, prev, i)
+		}
+		if prev, dup := seenTokens[t.Token]; dup {
+			return fmt.Errorf("config: static token %q reuses the secret from index %d", t.Name, prev)
+		}
+		seenNames[t.Name] = i
+		seenTokens[t.Token] = i
 	}
 	return nil
 }
@@ -212,6 +263,9 @@ func (c *ServerConfig) applyDefaults() {
 	setInt(&c.MaxValueBytes, 256<<10) // 256 KiB
 	setInt(&c.RateLimitPerMin, 6)     // a push every ~10s is plenty
 	setInt(&c.MaxConcurrent, 64)
+	setInt(&c.PoolMaxConns, c.MaxConcurrent+poolHeadroom) // after MaxConcurrent is set
+	setInt(&c.DirtyStreakThreshold, 10)
+	setInt(&c.AuthFailPerMin, 60) // 1/s per source: fine for humans, hostile to brute force
 	setDur(&c.ExpiryTTL, 7*24*time.Hour)
 	if c.OIDC.RolesClaim == "" {
 		c.OIDC.RolesClaim = "groups"

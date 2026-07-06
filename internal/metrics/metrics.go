@@ -13,10 +13,11 @@ import (
 type Metrics struct {
 	reg *prometheus.Registry
 
-	Pushes   *prometheus.CounterVec // result=applied|rejected
-	Rejects  *prometheus.CounterVec // reason=stale|skewed|...
-	ApplySec prometheus.Histogram   // apply transaction latency
-	LagSec   prometheus.Histogram   // received_at - producer_timestamp on applied pushes
+	Pushes     *prometheus.CounterVec // result=applied|rejected
+	Rejects    *prometheus.CounterVec // reason=stale|skewed|...
+	ApplySec   prometheus.Histogram   // apply transaction latency
+	LagSec     prometheus.Histogram   // received_at - producer_timestamp on applied pushes
+	DirtyNodes prometheus.Gauge       // nodes with a consecutive-dirty streak over threshold
 }
 
 // New registers the collectors on a fresh registry.
@@ -42,8 +43,12 @@ func New() *Metrics {
 			Help:    "received_at - producer_timestamp for applied pushes.",
 			Buckets: []float64{1, 5, 15, 60, 300, 1800, 7200, 86400},
 		}),
+		DirtyNodes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "chronicle_ingest_dirty_streak_nodes",
+			Help: "Nodes whose consecutive discovery-dirty pass streak is over the alarm threshold (tombstones frozen by the carry-forward gate).",
+		}),
 	}
-	reg.MustRegister(m.Pushes, m.Rejects, m.ApplySec, m.LagSec)
+	reg.MustRegister(m.Pushes, m.Rejects, m.ApplySec, m.LagSec, m.DirtyNodes)
 	return m
 }
 

@@ -27,9 +27,8 @@ type DiscoveryStatus struct {
 
 // Status values.
 const (
-	StatusOK     = "ok"
-	StatusError  = "error"
-	StatusAbsent = "absent"
+	StatusOK    = "ok"
+	StatusError = "error"
 )
 
 // Clean reports whether discovery had no source error this pass. An absent
@@ -47,6 +46,24 @@ func (d DiscoveryStatus) Clean() bool {
 		}
 	}
 	return true
+}
+
+// FailingSources lists the built-in namespaces and external files that reported
+// an error this pass (the reason a pass is dirty). Used for the per-node
+// dirty-streak log so an operator can see which sources froze the tombstones.
+func (d DiscoveryStatus) FailingSources() []string {
+	var out []string
+	for name, s := range d.Builtin {
+		if s == StatusError {
+			out = append(out, name)
+		}
+	}
+	for path, s := range d.External {
+		if s == StatusError {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 // PushResponse is the ingest reply (fact-ingest "Response contract"). Applied

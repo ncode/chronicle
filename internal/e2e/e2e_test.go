@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -44,7 +45,7 @@ func newStore(t *testing.T) (*store.Store, context.Context) {
 		t.Skip("set CHRONICLE_TEST_DB to run e2e tests")
 	}
 	ctx := context.Background()
-	st, err := store.Open(ctx, dsn)
+	st, err := store.Open(ctx, dsn, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func TestRealFactsPushed(t *testing.T) {
 	tree, _ := json.Marshal(snap.Tree())
 
 	pr, status := pushSnapshot(t, client, srv.URL,
-		wire.Push{ProducerTimestamp: time.Now(), Tree: tree})
+		wire.Push{ProducerTimestamp: time.Now(), Tree: tree, Discovery: okDisc})
 	if status != http.StatusOK || !pr.Applied {
 		t.Fatalf("real-facts push = %d %+v", status, pr)
 	}
@@ -140,11 +141,15 @@ func TestPipelineNowAtTDiff(t *testing.T) {
 	client := mtlsClient(ca, ca.IssueClient(t, "pipe.node").TLS)
 
 	eng := &queryEngine{store: st}
-	t1 := time.Date(2026, 2, 1, 10, 0, 0, 0, time.UTC)
-	t2 := time.Date(2026, 2, 1, 11, 0, 0, 0, time.UTC)
+	// The mTLS ingest handler anchors received=now, and first contact rejects a
+	// producer_timestamp older than max_skew (5m). Use near-now points a few
+	// minutes apart so the at-T query still has a genuine window between them.
+	base := time.Now().Truncate(time.Second)
+	t1 := base.Add(-4 * time.Minute)
+	t2 := base.Add(-1 * time.Minute)
 
 	if pr, status := pushSnapshot(t, client, srv.URL, wire.Push{
-		ProducerTimestamp: t1, Tree: json.RawMessage(`{"role":"web","os":{"name":"Debian"}}`),
+		ProducerTimestamp: t1, Tree: json.RawMessage(`{"role":"web","os":{"name":"Debian"}}`), Discovery: okDisc,
 	}); status != http.StatusOK {
 		t.Fatalf("t1 push = %d %+v", status, pr)
 	}
@@ -153,7 +158,7 @@ func TestPipelineNowAtTDiff(t *testing.T) {
 	}
 
 	if pr, status := pushSnapshot(t, client, srv.URL, wire.Push{
-		ProducerTimestamp: t2, Tree: json.RawMessage(`{"role":"web","os":{"name":"Ubuntu"}}`),
+		ProducerTimestamp: t2, Tree: json.RawMessage(`{"role":"web","os":{"name":"Ubuntu"}}`), Discovery: okDisc,
 	}); status != http.StatusOK {
 		t.Fatalf("t2 push = %d %+v", status, pr)
 	}
@@ -162,7 +167,7 @@ func TestPipelineNowAtTDiff(t *testing.T) {
 	if got := eng.filter(t, ctx, `os.name=Ubuntu`); !equalSet(got, []string{"pipe.node"}) {
 		t.Fatalf("now Ubuntu = %v", got)
 	}
-	mid := t1.Add(30 * time.Minute).Format(time.RFC3339)
+	mid := t1.Add(90 * time.Second).Format(time.RFC3339) // between t1 and t2
 	if got := eng.filter(t, ctx, `os.name=Debian at `+mid); !equalSet(got, []string{"pipe.node"}) {
 		t.Fatalf("at-T Debian = %v", got)
 	}
@@ -209,6 +214,7 @@ func TestScaleSmoke(t *testing.T) {
 		return certname(i), wire.Push{
 			ProducerTimestamp: base,
 			Tree:              json.RawMessage(`{"role":"web","os":{"name":"Debian"},"kernel":"6.1"}`),
+			Discovery:         okDisc,
 		}
 	})
 	t.Logf("cold-start %d nodes in %s", fleet, time.Since(coldStart))
@@ -219,6 +225,7 @@ func TestScaleSmoke(t *testing.T) {
 		return certname(i), wire.Push{
 			ProducerTimestamp: base.Add(time.Hour),
 			Tree:              json.RawMessage(`{"role":"web","os":{"name":"Debian"},"kernel":"6.2"}`),
+			Discovery:         okDisc,
 		}
 	})
 	t.Logf("change-burst %d nodes in %s", fleet, time.Since(burst))
@@ -258,21 +265,11 @@ func runFleet(t *testing.T, ctx context.Context, svc *ingest.Service, n int, mk 
 	}
 }
 
-func certname(i int) string { return "fleet-" + itoa(i) }
+func certname(i int) string { return "fleet-" + strconv.Itoa(i) }
 
-func itoa(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	var b [12]byte
-	p := len(b)
-	for i > 0 {
-		p--
-		b[p] = byte('0' + i%10)
-		i /= 10
-	}
-	return string(b[p:])
-}
+// okDisc is a non-empty clean discovery report; a real agent always sends one,
+// and an empty report is now a degenerate reject (task 1.1).
+var okDisc = wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}}
 
 func equalSet(got, want []string) bool {
 	if len(got) != len(want) {

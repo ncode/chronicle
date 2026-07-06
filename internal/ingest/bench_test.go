@@ -3,16 +3,17 @@ package ingest
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/ncode/chronicle/internal/classify"
-	"github.com/ncode/chronicle/internal/store"
+	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/wire"
 )
 
 // nodeSnapshot is a representative single-node facts push (~60 leaves, ~53
 // durable: os, networking interfaces, memory, processors, mountpoints, plus
 // volatile load/uptime). This is the unit of work the ingest CPU path processes
-// per push; TestSnapshotLeafCount pins the exact size the findings doc cites.
+// per push; TestSnapshotLeafCount pins the exact size PERF_FINDINGS.md cites.
 const nodeSnapshot = `{
   "os": {
     "name": "Debian", "family": "Debian", "architecture": "amd64",
@@ -48,63 +49,38 @@ const nodeSnapshot = `{
 // realisticVolatilePatterns mirror a typical deployment: a handful of globs.
 var realisticVolatilePatterns = []string{"uptime", "uptime_seconds", "load*", "memory.system.available_bytes", "memory.swap.available_bytes"}
 
-// pendingLeafBench mirrors the per-leaf struct built inside Apply so the
-// benchmark allocates the same slice the real path does.
-type pendingLeafBench struct {
-	path, factName string
-	value          json.RawMessage
-	hash           [32]byte
-}
-
 // BenchmarkApplyCPU measures the per-push CPU work in Service.Apply, excluding
-// only DB I/O. It faithfully mirrors ingest.go Apply: per-push decodeTree (real
-// Apply decodes every push), Flatten, then per leaf the MaxPathLen/MaxValueBytes
-// guards + json.Marshal + classify + ValueHash + pending/volatile slice build,
-// then the volatile-blob marshal. This is a true CPU floor for one push (the DB
-// tx is layered on top of it), not a microbenchmark of one function.
+// only DB I/O, by calling the real plan(): per-push decodeTree, Flatten (with
+// the caps), then per leaf json.Marshal + classify + ValueHash + pending/volatile
+// slice build, then the volatile-blob marshal. Calling plan() directly (rather
+// than a hand-copied mirror) keeps the benchmark honest as the CPU path evolves.
 func BenchmarkApplyCPU(b *testing.B) {
-	raw := json.RawMessage(nodeSnapshot)
 	cl, err := classify.New(realisticVolatilePatterns)
 	if err != nil {
 		b.Fatal(err)
 	}
-	// Representative caps (config.ServerConfig defaults); the checks are cheap len
-	// comparisons included for fidelity, not to reject this fixture.
-	const maxPathLen, maxValueBytes = 512, 1 << 20
+	cfg := &config.ServerConfig{
+		MaxSkew:       config.Duration(5 * time.Minute),
+		MaxLeafCount:  50_000,
+		MaxPathLen:    1024,
+		MaxValueBytes: 256 << 10,
+	}
+	received := time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
+	push := &wire.Push{
+		ProducerTimestamp: received,
+		Tree:              json.RawMessage(nodeSnapshot),
+		Discovery:         wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}},
+	}
 	b.ReportAllocs()
 	for b.Loop() {
-		tree, err := decodeTree(raw) // per-push decode, as real Apply does
-		if err != nil {
-			b.Fatal(err)
+		pl, _, _ := plan(cfg, cl, push, received)
+		if pl == nil {
+			b.Fatal("push unexpectedly rejected")
 		}
-		leaves := wire.Flatten(tree)
-		pending := make([]pendingLeafBench, 0, len(leaves))
-		volatile := make(map[string]any, 8)
-		for _, lf := range leaves {
-			if len(lf.Path) > maxPathLen {
-				b.Fatalf("path too long: %s", lf.Path)
-			}
-			rawVal, err := json.Marshal(lf.Value)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if len(rawVal) > maxValueBytes {
-				b.Fatal("value too big")
-			}
-			if cl.IsVolatile(lf.Path) {
-				volatile[lf.Path] = lf.Value
-				continue
-			}
-			pending = append(pending, pendingLeafBench{lf.Path, lf.FactName, rawVal, store.ValueHash(lf.Value)})
-		}
-		if _, err := json.Marshal(volatile); err != nil {
-			b.Fatal(err)
-		}
-		_ = pending
 	}
 }
 
-// TestSnapshotLeafCount pins the fixture size the findings doc cites, so the
+// TestSnapshotLeafCount pins the fixture size PERF_FINDINGS.md cites, so the
 // "~N leaves, M durable" claim can't silently drift. Uses the real decode +
 // Flatten + classifier so it measures exactly what Apply would see.
 func TestSnapshotLeafCount(t *testing.T) {
@@ -116,7 +92,10 @@ func TestSnapshotLeafCount(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	leaves := wire.Flatten(tree)
+	leaves, err := wire.Flatten(tree, wire.FlattenLimits{})
+	if err != nil {
+		t.Fatal(err)
+	}
 	durable := 0
 	for _, lf := range leaves {
 		if !cl.IsVolatile(lf.Path) {

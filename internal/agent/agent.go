@@ -7,6 +7,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,13 +26,14 @@ import (
 
 // Agent collects and pushes snapshots for one node.
 type Agent struct {
-	cfg     *config.AgentConfig
-	log     *slog.Logger
-	eng     *facts.Engine
-	client  *http.Client
-	pushURL string
-	limURL  string
-	limits  wire.Limits
+	cfg        *config.AgentConfig
+	log        *slog.Logger
+	eng        *facts.Engine
+	client     *http.Client
+	pushURL    string
+	limURL     string
+	limits     wire.Limits
+	haveLimits bool // true once the server's real limits have been fetched
 }
 
 // New builds an agent: loads the pre-provisioned facts-ca identity (no enroll),
@@ -80,11 +82,7 @@ func New(cfg *config.AgentConfig, log *slog.Logger) (*Agent, error) {
 // Run is the collection loop. An initial small jitter desynchronizes a fleet
 // that boots together; each subsequent cycle waits interval ± jitter.
 func (a *Agent) Run(ctx context.Context) error {
-	if l, err := a.fetchLimits(ctx); err == nil {
-		a.limits = l
-	} else {
-		a.log.Warn("limits fetch failed; using generous local defaults", "err", err)
-	}
+	a.refreshLimits(ctx) // best-effort at startup; retried each cycle until it succeeds
 
 	// Initial desync delay in [0, jitter).
 	if d := a.cfg.Jitter.D(); d > 0 {
@@ -97,6 +95,23 @@ func (a *Agent) Run(ctx context.Context) error {
 		if !sleep(ctx, a.nextInterval()) {
 			return ctx.Err()
 		}
+	}
+}
+
+// refreshLimits fetches the server's advertised limits until it succeeds once,
+// then stops. When the startup fetch fails the agent runs on generous local
+// defaults and retries on each subsequent cycle (the cycle period is the
+// backoff), so a transient outage does not pin fallback defaults for the whole
+// process lifetime (node-agent spec).
+func (a *Agent) refreshLimits(ctx context.Context) {
+	if a.haveLimits {
+		return
+	}
+	if l, err := a.fetchLimits(ctx); err == nil {
+		a.limits = l
+		a.haveLimits = true
+	} else {
+		a.log.Warn("limits fetch failed; using generous local defaults, will retry next cycle", "err", err)
 	}
 }
 
@@ -115,23 +130,31 @@ func (a *Agent) nextInterval() time.Duration {
 }
 
 func (a *Agent) collectAndPush(ctx context.Context) {
+	a.refreshLimits(ctx) // converge to the server's real limits if startup missed them
 	push, tree, err := a.collect(ctx)
 	if err != nil {
 		a.log.Error("collect", "err", err)
 		return
 	}
-	// Pre-check the server-advertised caps; don't send a body the server will
-	// reject (node-agent "Bounded Snapshot Payload").
-	if a.limits.MaxSnapshotBytes > 0 && int64(len(push.Tree)) > a.limits.MaxSnapshotBytes {
-		a.log.Error("snapshot exceeds advertised cap; not sending",
-			"cap", "snapshot-bytes", "bytes", len(push.Tree), "limit", a.limits.MaxSnapshotBytes)
+	// Marshal once and pre-check the server-advertised snapshot-byte cap against
+	// the SERIALIZED push body — the exact unit the server's MaxBytesReader
+	// enforces — not the smaller len(tree) proxy, so a body that passes here is
+	// not deterministically rejected as oversized every cycle (node-agent spec).
+	body, err := json.Marshal(push)
+	if err != nil {
+		a.log.Error("marshal push", "err", err)
+		return
+	}
+	if a.limits.MaxSnapshotBytes > 0 && int64(len(body)) > a.limits.MaxSnapshotBytes {
+		a.log.Error("push body exceeds advertised cap; not sending",
+			"cap", "snapshot-bytes", "bytes", len(body), "limit", a.limits.MaxSnapshotBytes)
 		return
 	}
 	if over := a.exceedsLimits(tree); over != "" {
 		a.log.Error("snapshot exceeds advertised cap; not sending", "cap", over)
 		return
 	}
-	a.pushWithRetry(ctx, push)
+	a.pushWithRetry(ctx, body)
 }
 
 // collect runs one discovery pass and assembles the push payload (snapshot +
@@ -181,16 +204,22 @@ func DryRun(ctx context.Context, cfg *config.AgentConfig, log *slog.Logger, w io
 }
 
 // exceedsLimits reports the first advertised cap a flattened snapshot would
-// violate (leaf-count, path-length, value-bytes), or "" if it is within bounds.
+// violate (leaf-count, path-length, value-bytes) or a flatten defect (colliding
+// paths), or "" if it is within bounds. The leaf-count and path-length caps are
+// enforced by Flatten itself (shared with the server), so a collision or cap is
+// caught here before the wire.
 func (a *Agent) exceedsLimits(tree map[string]any) string {
-	leaves := wire.Flatten(tree)
-	if a.limits.MaxLeafCount > 0 && len(leaves) > a.limits.MaxLeafCount {
-		return "leaf-count"
+	leaves, err := wire.Flatten(tree, wire.FlattenLimits{MaxLeafCount: a.limits.MaxLeafCount, MaxPathLen: a.limits.MaxPathLen})
+	if err != nil {
+		if ce, ok := errors.AsType[*wire.CapError](err); ok {
+			return ce.Which
+		}
+		if col, ok := errors.AsType[*wire.CollisionError](err); ok {
+			return "collision:" + col.Path
+		}
+		return "flatten-error"
 	}
 	for _, lf := range leaves {
-		if a.limits.MaxPathLen > 0 && len(lf.Path) > a.limits.MaxPathLen {
-			return "path-length"
-		}
 		if a.limits.MaxValueBytes > 0 {
 			if raw, err := json.Marshal(lf.Value); err == nil && len(raw) > a.limits.MaxValueBytes {
 				return "value-bytes"

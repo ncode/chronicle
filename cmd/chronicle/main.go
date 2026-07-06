@@ -54,7 +54,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.Open(ctx, cfg.DatabaseURL)
+	st, err := store.Open(ctx, cfg.DatabaseURL, cfg.PoolMaxConns)
 	if err != nil {
 		return err
 	}
@@ -112,10 +112,17 @@ func run() error {
 
 	go reloadOnHUP(ctx, log, *cfgPath, ingestSvc, querySvc, crl)
 
+	// Each server runs two group goroutines: one serves, one waits for shutdown
+	// and drains. Both are in the errgroup, so g.Wait() blocks until every drain
+	// completes — main (and thus `defer st.Close()`) only proceeds after the pool
+	// has no in-flight request left (task 1.4).
 	g, gctx := errgroup.WithContext(ctx)
-	g.Go(func() error { return serveTLS(gctx, ingestSrv) })
-	g.Go(func() error { return serveTLS(gctx, readSrv) })
-	g.Go(func() error { return serve(gctx, opsSrv) })
+	for _, srv := range []*http.Server{ingestSrv, readSrv} {
+		g.Go(func() error { return serveTLS(srv) })
+		g.Go(func() error { return awaitShutdown(gctx, srv) })
+	}
+	g.Go(func() error { return serve(opsSrv) })
+	g.Go(func() error { return awaitShutdown(gctx, opsSrv) })
 	g.Go(func() error { lc.Run(gctx, time.Hour); return nil })
 	g.Go(func() error { mon.Run(gctx, time.Hour); return nil })
 
@@ -169,6 +176,20 @@ func reloadOnHUP(ctx context.Context, log *slog.Logger, cfgPath string, ingestSv
 			} else {
 				log.Info("reloaded volatile policy", "patterns", len(cfg.VolatilePaths))
 			}
+			// Auth reload: the static-token half always swaps (revoking a leaked
+			// token takes effect now); an error means only the OIDC verifier was
+			// kept fail-closed because the IdP was unreachable (task 4.1). Bound the
+			// OIDC discovery with a timeout so an unreachable/hanging IdP cannot
+			// wedge this reload goroutine (and thus later SIGHUPs and the CRL
+			// reload below) indefinitely.
+			authCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			authErr := querySvc.ReloadAuth(authCtx, cfg)
+			cancel()
+			if authErr != nil {
+				log.Error("reload: oidc verifier kept fail-closed (static tokens still swapped)", "err", authErr)
+			} else {
+				log.Info("reloaded authenticator", "static_tokens", len(cfg.StaticTokens))
+			}
 			if crl != nil {
 				if err := crl.Reload(); err != nil {
 					log.Error("reload: CRL", "err", err)
@@ -180,25 +201,26 @@ func reloadOnHUP(ctx context.Context, log *slog.Logger, cfgPath string, ingestSv
 	}
 }
 
-func serveTLS(ctx context.Context, srv *http.Server) error {
-	go shutdownOnDone(ctx, srv)
+func serveTLS(srv *http.Server) error {
 	if err := srv.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-func serve(ctx context.Context, srv *http.Server) error {
-	go shutdownOnDone(ctx, srv)
+func serve(srv *http.Server) error {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
 }
 
-func shutdownOnDone(ctx context.Context, srv *http.Server) {
+// awaitShutdown blocks until ctx is cancelled, then drains srv within a bounded
+// window. Run as an errgroup member so its return value is awaited: g.Wait()
+// does not return — and the pool is not closed — until the drain finishes.
+func awaitShutdown(ctx context.Context, srv *http.Server) error {
 	<-ctx.Done()
-	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	drainCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(sctx)
+	return srv.Shutdown(drainCtx)
 }

@@ -35,6 +35,12 @@ func planPolicy(t *testing.T) *classify.Policy {
 
 var planReceived = time.Date(2026, 6, 28, 12, 0, 0, 0, time.UTC)
 
+// okReport is a minimal clean discovery report so a push is not rejected as
+// degenerate (a real push always carries a report).
+func okReport() wire.DiscoveryStatus {
+	return wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}}
+}
+
 func TestPlanRejects(t *testing.T) {
 	cl := planPolicy(t)
 	ts := planReceived // within skew
@@ -44,19 +50,24 @@ func TestPlanRejects(t *testing.T) {
 		cfg        func(*config.ServerConfig)
 		ts         time.Time
 		tree       string
+		report     wire.DiscoveryStatus
 		wantReason string
 		wantStatus int
 	}{
-		{"zero timestamp", nil, time.Time{}, `{"os":{"name":"Debian"}}`, wire.ReasonBadRequest, http.StatusBadRequest},
-		{"bad json tree", nil, ts, `{not json`, wire.ReasonBadRequest, http.StatusBadRequest},
+		{"zero timestamp", nil, time.Time{}, `{"os":{"name":"Debian"}}`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
+		{"missing report", nil, ts, `{"os":{"name":"Debian"}}`, wire.DiscoveryStatus{}, wire.ReasonBadRequest, http.StatusBadRequest},
+		{"empty tree", nil, ts, `{}`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
+		{"null tree", nil, ts, `null`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
+		{"colliding paths", nil, ts, `{"a":{"b":1},"a.b":2}`, okReport(), wire.ReasonBadRequest + ": colliding path a.b", http.StatusBadRequest},
+		{"bad json tree", nil, ts, `{not json`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
 		{"oversized leaf-count", func(c *config.ServerConfig) { c.MaxLeafCount = 1 }, ts,
-			`{"a":1,"b":2}`, "oversized: leaf-count", http.StatusRequestEntityTooLarge},
-		{"skewed future", nil, planReceived.Add(10 * time.Minute), `{"os":{"name":"Debian"}}`,
+			`{"a":1,"b":2}`, okReport(), "oversized: leaf-count", http.StatusRequestEntityTooLarge},
+		{"skewed future", nil, planReceived.Add(10 * time.Minute), `{"os":{"name":"Debian"}}`, okReport(),
 			wire.ReasonSkewed, http.StatusConflict},
 		{"oversized path-length", func(c *config.ServerConfig) { c.MaxPathLen = 8 }, ts,
-			`{"verylongkey":1}`, "oversized: path-length", http.StatusRequestEntityTooLarge},
+			`{"verylongkey":1}`, okReport(), "oversized: path-length", http.StatusRequestEntityTooLarge},
 		{"oversized value-bytes", func(c *config.ServerConfig) { c.MaxValueBytes = 4 }, ts,
-			`{"k":"abcdefgh"}`, "oversized: value-bytes", http.StatusRequestEntityTooLarge},
+			`{"k":"abcdefgh"}`, okReport(), "oversized: value-bytes", http.StatusRequestEntityTooLarge},
 	}
 
 	for _, tc := range cases {
@@ -65,7 +76,7 @@ func TestPlanRejects(t *testing.T) {
 			if tc.cfg != nil {
 				tc.cfg(cfg)
 			}
-			push := &wire.Push{ProducerTimestamp: tc.ts, Tree: json.RawMessage(tc.tree)}
+			push := &wire.Push{ProducerTimestamp: tc.ts, Tree: json.RawMessage(tc.tree), Discovery: tc.report}
 			pl, resp, status := plan(cfg, cl, push, planReceived)
 			if pl != nil {
 				t.Fatalf("want reject, got plan %+v", pl)
@@ -82,6 +93,7 @@ func TestPlanClassifiesAndSplits(t *testing.T) {
 	push := &wire.Push{
 		ProducerTimestamp: planReceived,
 		Tree:              json.RawMessage(`{"os":{"name":"Debian"},"uptime":12345,"load":{"1m":"0.4"}}`),
+		Discovery:         okReport(),
 	}
 	pl, _, status := plan(planCfg(), cl, push, planReceived)
 	if pl == nil {
@@ -113,10 +125,10 @@ func TestPlanCleanFlag(t *testing.T) {
 	cl := planPolicy(t)
 	tree := json.RawMessage(`{"os":{"name":"Debian"}}`)
 
-	// Default (no source errors) is clean.
-	clean := &wire.Push{ProducerTimestamp: planReceived, Tree: tree}
+	// A report with no source errors is clean.
+	clean := &wire.Push{ProducerTimestamp: planReceived, Tree: tree, Discovery: okReport()}
 	if pl, _, _ := plan(planCfg(), cl, clean, planReceived); pl == nil || !pl.clean {
-		t.Fatal("default discovery must be clean")
+		t.Fatal("a report with no source errors must be clean")
 	}
 
 	// A built-in source error makes the pass dirty (carry-forward, not tombstone).
