@@ -63,41 +63,23 @@ func (m *Monitor) Run(ctx context.Context, interval time.Duration) {
 // the window — the signature of a misclassified Volatile fact. The fix is
 // forward-only reclassification: add the path to the Volatile policy.
 func (m *Monitor) CheckChurn(ctx context.Context) ([]Finding, error) {
-	return m.scan(ctx, `
-		SELECT fp.path_text, count(*) AS opens
-		FROM   fact_history fh JOIN fact_paths fp USING (path_id)
-		WHERE  fh.valid_from > $1
-		GROUP  BY fp.path_text
-		HAVING count(*) >= $2
-		ORDER  BY opens DESC
-		LIMIT  20`, time.Now().Add(-m.churnWindow), m.churnThreshold)
+	rows, err := m.store.HighChurn(ctx, time.Now().Add(-m.churnWindow), m.churnThreshold)
+	// Partial rows before a mid-scan error are still findings — keep them
+	// alongside the error so Run logs what was seen.
+	var out []Finding
+	for _, r := range rows {
+		out = append(out, Finding{Key: r.Key, Count: r.Count})
+	}
+	return out, err
 }
 
 // CheckCardinality flags nodes whose distinct fact_paths count is abnormally
 // high — one authenticated node trying to bloat the shared dictionary.
 func (m *Monitor) CheckCardinality(ctx context.Context) ([]Finding, error) {
-	return m.scan(ctx, `
-		SELECT n.certname, count(DISTINCT fh.path_id) AS paths
-		FROM   fact_history fh JOIN nodes n USING (node_id)
-		GROUP  BY n.certname
-		HAVING count(DISTINCT fh.path_id) >= $1
-		ORDER  BY paths DESC
-		LIMIT  20`, m.cardThreshold)
-}
-
-func (m *Monitor) scan(ctx context.Context, sql string, args ...any) ([]Finding, error) {
-	rows, err := m.store.Pool().Query(ctx, sql, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	rows, err := m.store.FactPathCardinality(ctx, m.cardThreshold)
 	var out []Finding
-	for rows.Next() {
-		var f Finding
-		if err := rows.Scan(&f.Key, &f.Count); err != nil {
-			return nil, err
-		}
-		out = append(out, f)
+	for _, r := range rows {
+		out = append(out, Finding{Key: r.Key, Count: r.Count})
 	}
-	return out, rows.Err()
+	return out, err
 }

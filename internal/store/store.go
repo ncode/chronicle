@@ -49,22 +49,22 @@ func Open(ctx context.Context, dsn string, maxConns int) (*Store, error) {
 	return &Store{pool: pool, pathCache: make(map[string]int64)}, nil
 }
 
-// Pool exposes the underlying pool for transaction management by callers (ingest
-// opens the per-node serialized tx itself).
+// Pool exposes the underlying pool for sanctioned raw reads and test setup.
+// ApplySnapshot owns the per-node serialized transaction.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
 func (s *Store) Close() { s.pool.Close() }
 
 // ── Path interning (task 2.2) ───────────────────────────────────────────────
 
-// InternPath returns the path_id for a leaf path, inserting it if new. Runs on
+// internPath returns the path_id for a leaf path, inserting it if new. Runs on
 // the pool (autocommit), independent of any per-node ingest transaction, so path
 // creation never contends with node row locks. Cache-first: the path set is
 // low-cardinality and never deleted.
 //
 // ponytail: unbounded cache — fact_paths cardinality is bounded by the fleet's
 // distinct leaf paths and the cardinality alarm (task 7.2) catches a runaway.
-func (s *Store) InternPath(ctx context.Context, pathText, factName string) (int64, error) {
+func (s *Store) internPath(ctx context.Context, pathText, factName string) (int64, error) {
 	s.pathMu.RLock()
 	id, ok := s.pathCache[pathText]
 	s.pathMu.RUnlock()
@@ -123,14 +123,14 @@ type Node struct {
 	Expired        *time.Time
 }
 
-// LockNode creates the node on first contact and returns its row with a
+// lockNode creates the node on first contact and returns its row with a
 // FOR UPDATE lock held in tx, serializing concurrent pushes for one certname
 // (ADR-0009 §3). Identity is the verified cert CN; same CN = one history. The
 // returned `inserted` is true only when this call created the row (genuine first
 // contact) — distinguishing a truly-new node from an existing one whose watermark
 // was cleared by ResetProducerTS, so the first-contact clock bound does not wedge
 // an operator's watermark-reset recovery.
-func (s *Store) LockNode(ctx context.Context, tx pgx.Tx, certname string) (Node, bool, error) {
+func (s *Store) lockNode(ctx context.Context, tx pgx.Tx, certname string) (Node, bool, error) {
 	ct, err := tx.Exec(ctx,
 		`INSERT INTO nodes (certname) VALUES ($1) ON CONFLICT (certname) DO NOTHING`,
 		certname)
@@ -165,10 +165,10 @@ func (s *Store) PeekNode(ctx context.Context, certname string) (Node, bool, erro
 	return n, true, nil
 }
 
-// MarkContact advances last_seen (server clock) and, when ts is non-nil, the
+// markContact advances last_seen (server clock) and, when ts is non-nil, the
 // applied-snapshot watermark last_producer_ts. Clears expired (a returning push
 // un-expires — ADR-0011). Call inside the per-node tx after a successful apply.
-func (s *Store) MarkContact(ctx context.Context, tx pgx.Tx, nodeID int64, now time.Time, producerTS *time.Time) error {
+func (s *Store) markContact(ctx context.Context, tx pgx.Tx, nodeID int64, now time.Time, producerTS *time.Time) error {
 	_, err := tx.Exec(ctx,
 		`UPDATE nodes
 		    SET last_seen = $2,
@@ -227,7 +227,7 @@ func (s *Store) ResetProducerTS(ctx context.Context, certname string) error {
 
 // ExpireStale marks nodes `expired` that have had no contact for longer than
 // ttl. Soft and reversible: it closes no intervals and deletes nothing (a
-// returning push clears `expired` via MarkContact). Skips already-expired and
+// returning push clears `expired` via markContact). Skips already-expired and
 // deactivated nodes. Returns the number newly expired.
 func (s *Store) ExpireStale(ctx context.Context, ttl time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-ttl)
@@ -308,7 +308,7 @@ type ApplyStats struct {
 	Unchanged  int // value matched the open interval; nothing written
 }
 
-// ApplyDurable applies the whole Durable snapshot for one node at time t inside
+// applyDurable applies the whole Durable snapshot for one node at time t inside
 // the caller's transaction (which already holds the per-node lock and has run
 // the staleness/skew guards). It is change-only: unchanged leaves write nothing,
 // changed leaves close-then-open, new leaves open. Leaves currently open but
@@ -317,7 +317,7 @@ type ApplyStats struct {
 //
 // Read-free for present leaves: it reads the node's open set once, diffs in Go,
 // and batches the minimal close/open/tombstone statements in one round trip.
-func (s *Store) ApplyDurable(ctx context.Context, tx pgx.Tx, nodeID int64, leaves []DurableLeaf, t time.Time, discoveryClean bool) (ApplyStats, error) {
+func (s *Store) applyDurable(ctx context.Context, tx pgx.Tx, nodeID int64, leaves []DurableLeaf, t time.Time, discoveryClean bool) (ApplyStats, error) {
 	var stats ApplyStats
 
 	open, maxValidFrom, err := s.openHashes(ctx, tx, nodeID)
@@ -468,8 +468,8 @@ func (s *Store) maxClosedValidTo(ctx context.Context, tx pgx.Tx, nodeID int64) (
 
 // ── Volatile apply (task 2.5) ────────────────────────────────────────────────
 
-// UpsertVolatile overwrites the node's single latest-only volatile blob.
-func (s *Store) UpsertVolatile(ctx context.Context, tx pgx.Tx, nodeID int64, blob json.RawMessage, observedAt time.Time) error {
+// upsertVolatile overwrites the node's single latest-only volatile blob.
+func (s *Store) upsertVolatile(ctx context.Context, tx pgx.Tx, nodeID int64, blob json.RawMessage, observedAt time.Time) error {
 	_, err := tx.Exec(ctx,
 		`INSERT INTO node_volatile (node_id, volatile, observed_at)
 		 VALUES ($1, $2::jsonb, $3)
@@ -532,7 +532,7 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 	// connection, or concurrent lock-waiters could exhaust the pool and deadlock.
 	durable := make([]DurableLeaf, 0, len(pending))
 	for _, p := range pending {
-		pid, err := s.InternPath(ctx, p.Path, p.FactName)
+		pid, err := s.internPath(ctx, p.Path, p.FactName)
 		if err != nil {
 			return ApplyStats{}, fmt.Errorf("intern path %q: %w", p.Path, err)
 		}
@@ -545,7 +545,7 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback after commit is a no-op
 
-	node, inserted, err := s.LockNode(ctx, tx, certname)
+	node, inserted, err := s.lockNode(ctx, tx, certname)
 	if err != nil {
 		return ApplyStats{}, fmt.Errorf("lock node: %w", err)
 	}
@@ -560,24 +560,24 @@ func (s *Store) ApplySnapshot(ctx context.Context, certname string, received, pr
 	// fleet-wide at-T queries. Keyed on the authoritative `inserted` (this call
 	// created the row) — NOT on a nil watermark, which is also true after an
 	// operator ResetProducerTS, so a watermark-reset recovery push is not wedged.
-	// Rolls back cleanly (the LockNode INSERT is undone with the tx), so a
+	// Rolls back cleanly (the lockNode INSERT is undone with the tx), so a
 	// rejected first push persists no node row. Delayed non-first-contact pushes
 	// are unaffected (bounded by the watermark / the overlap guard).
 	if inserted && producerTS.Before(received.Add(-maxSkew)) {
 		return ApplyStats{}, ErrSkewed
 	}
 
-	stats, err := s.ApplyDurable(ctx, tx, node.ID, durable, producerTS, clean)
+	stats, err := s.applyDurable(ctx, tx, node.ID, durable, producerTS, clean)
 	if err != nil {
 		if errors.Is(err, ErrStaleApply) {
 			return ApplyStats{}, ErrStale
 		}
 		return ApplyStats{}, fmt.Errorf("apply durable: %w", err)
 	}
-	if err := s.UpsertVolatile(ctx, tx, node.ID, volBlob, producerTS); err != nil {
+	if err := s.upsertVolatile(ctx, tx, node.ID, volBlob, producerTS); err != nil {
 		return ApplyStats{}, fmt.Errorf("upsert volatile: %w", err)
 	}
-	if err := s.MarkContact(ctx, tx, node.ID, received, &producerTS); err != nil {
+	if err := s.markContact(ctx, tx, node.ID, received, &producerTS); err != nil {
 		return ApplyStats{}, fmt.Errorf("mark contact: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -698,6 +698,60 @@ func (s *Store) Diff(ctx context.Context, nodeID int64, t1, t2 time.Time) ([]Dif
 		}
 		d.ValidTo, d.Open = closeTime(vt)
 		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// CountRow is one (key, count) result from the monitor scans — a path and its
+// interval-open count for HighChurn, a certname and its distinct-path count for
+// FactPathCardinality.
+type CountRow struct {
+	Key   string
+	Count int64
+}
+
+// HighChurn returns durable paths that opened at least threshold intervals
+// since the caller-computed lower bound.
+func (s *Store) HighChurn(ctx context.Context, since time.Time, threshold int64) ([]CountRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT fp.path_text, count(*) AS opens
+		FROM   fact_history fh JOIN fact_paths fp USING (path_id)
+		WHERE  fh.valid_from > $1
+		GROUP  BY fp.path_text
+		HAVING count(*) >= $2
+		ORDER  BY opens DESC
+		LIMIT  20`, since, threshold)
+	if err != nil {
+		return nil, err
+	}
+	return scanCountRows(rows)
+}
+
+// FactPathCardinality returns nodes with at least threshold distinct durable
+// fact paths.
+func (s *Store) FactPathCardinality(ctx context.Context, threshold int64) ([]CountRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT n.certname, count(DISTINCT fh.path_id) AS paths
+		FROM   fact_history fh JOIN nodes n USING (node_id)
+		GROUP  BY n.certname
+		HAVING count(DISTINCT fh.path_id) >= $1
+		ORDER  BY paths DESC
+		LIMIT  20`, threshold)
+	if err != nil {
+		return nil, err
+	}
+	return scanCountRows(rows)
+}
+
+func scanCountRows(rows pgx.Rows) ([]CountRow, error) {
+	defer rows.Close()
+	var out []CountRow
+	for rows.Next() {
+		var r CountRow
+		if err := rows.Scan(&r.Key, &r.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
 	}
 	return out, rows.Err()
 }

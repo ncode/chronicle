@@ -160,13 +160,16 @@ func TestQueryEndpointMapsErrors(t *testing.T) {
 		{"missing q", "/v1/query", 400, ""},
 		{"unparsable DSL", "/v1/query?q=role", 400, ""},
 		{"oversized DSL", "/v1/query?q=" + strings.Repeat("a", maxDSLLen+1), 413, ""},
+		// Exactly at the cap is NOT oversized: it falls through to the parser,
+		// which rejects the gibberish with 400 (pins the > vs >= boundary).
+		{"DSL exactly at cap", "/v1/query?q=" + strings.Repeat("a", maxDSLLen), 400, ""},
 		{"volatile at past", "/v1/query?q=" + url.QueryEscape("uptime=123 at 2026-01-01T09:00:00Z"), 422, ErrNoHistory.Error()},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := serveRead(t, h, http.MethodGet, tt.path, "r-tok")
 			if w.Code != tt.want {
-				t.Fatalf("%s = %d, want %d", tt.name, w.Code, tt.want)
+				t.Fatalf("%s = %d, want %d (body: %s)", tt.name, w.Code, tt.want, w.Body.String())
 			}
 			if tt.wantErrText == "" {
 				return
@@ -250,6 +253,16 @@ func TestResetWatermarkEndToEnd(t *testing.T) {
 	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
 
+	// A reader's attempt is refused AND leaves the poisoned watermark in place:
+	// the same stale push must still be rejected (spec: "last_producer_ts is
+	// unchanged").
+	if code := httpPost(t, srv.URL, "/v1/admin/reset-watermark?certname="+url.QueryEscape(certname), "r-tok"); code != 403 {
+		t.Fatalf("reader reset-watermark = %d, want 403", code)
+	}
+	if status, body := httpPush(t, ing, certname, push(`{"os":{"name":"B"}}`, normalTS)); status != 409 || body["reason"] != wire.ReasonStale {
+		t.Fatalf("push after reader 403 = %d %+v, want 409 stale (watermark must be untouched)", status, body)
+	}
+
 	if code := httpPost(t, srv.URL, "/v1/admin/reset-watermark?certname="+url.QueryEscape(certname), "a-tok"); code != 200 {
 		t.Fatalf("admin reset-watermark = %d, want 200", code)
 	}
@@ -264,13 +277,10 @@ func TestResetWatermarkEndToEnd(t *testing.T) {
 func TestStateEndpoint(t *testing.T) {
 	svc, st, ctx := testReadService(t)
 	seed(t, st, ctx, "web01", qt1, map[string]any{"role": "web", "os.name": "Debian"})
-	// A later durable change, so there is a genuine past state to reconstruct.
-	seed(t, st, ctx, "web01", qt2, map[string]any{"role": "web", "os.name": "Ubuntu"})
-	if _, err := st.Pool().Exec(ctx,
-		`INSERT INTO node_volatile (node_id, volatile, observed_at)
-		 VALUES ((SELECT node_id FROM nodes WHERE certname='web01'), '{"uptime":123}'::jsonb, $1)`, qt2); err != nil {
-		t.Fatal(err)
-	}
+	// A later durable change (so there is a genuine past state to reconstruct),
+	// carrying the volatile blob through the same apply.
+	seedSnapshot(t, st, ctx, "web01", qt2, map[string]any{"role": "web", "os.name": "Ubuntu"},
+		json.RawMessage(`{"uptime":123}`))
 
 	srv := httptest.NewServer(svc.Handler())
 	defer srv.Close()
@@ -304,8 +314,15 @@ func TestStateEndpoint(t *testing.T) {
 	}
 
 	// A node with durable facts but no volatile blob reports volatile_available:false
-	// and omits the volatile key (no synthetic empty object).
+	// and omits the volatile key (no synthetic empty object). Every apply writes a
+	// node_volatile row, so the absent-row state is unreachable through the write
+	// door; construct it with scaffolding SQL to exercise the endpoint's defensive
+	// branch.
 	seed(t, st, ctx, "novol", qt1, map[string]any{"role": "web"})
+	if _, err := st.Pool().Exec(ctx,
+		`DELETE FROM node_volatile WHERE node_id = (SELECT node_id FROM nodes WHERE certname='novol')`); err != nil {
+		t.Fatal(err)
+	}
 	code, body = httpGet(t, srv.URL, "/v1/nodes/novol/state", "r-tok")
 	if code != 200 || body["volatile_available"] != false {
 		t.Fatalf("no-volatile node: code=%d available=%v", code, body["volatile_available"])
