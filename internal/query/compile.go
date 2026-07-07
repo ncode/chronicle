@@ -36,14 +36,15 @@ func (a *argBuf) p(v any) string {
 // SQL (a pure transformation), then execute. includeInactive re-includes
 // deactivated/expired nodes (default excludes them — fact-query spec).
 func (e *Engine) Run(ctx context.Context, q *Query, includeInactive bool) (*Result, error) {
-	if err := e.checkVolatileHistory(q); err != nil {
+	cl := e.classifier.Load()
+	if err := checkVolatileHistory(q, cl); err != nil {
 		return nil, err
 	}
 	paths, err := e.resolvePaths(ctx, q)
 	if err != nil {
 		return nil, err
 	}
-	sql, args, empty, err := compile(q, e.classifier, paths, includeInactive)
+	sql, args, empty, err := compile(q, cl, paths, includeInactive)
 	if err != nil {
 		return nil, err
 	}
@@ -102,16 +103,16 @@ func (e *Engine) resolvePaths(ctx context.Context, q *Query) (map[string]int64, 
 
 // checkVolatileHistory enforces: a volatile path with an explicit `at <T>` has
 // no history (volatile is latest-only — ADR-0007/0008).
-func (e *Engine) checkVolatileHistory(q *Query) error {
+func checkVolatileHistory(q *Query, cl *classify.Policy) error {
 	if q.At == nil {
 		return nil // `now` (or omitted) is fine; volatile routes to node_volatile
 	}
 	for _, t := range q.Terms {
-		if e.classifier.IsVolatile(t.Path) {
+		if cl.IsVolatile(t.Path) {
 			return fmt.Errorf("%w: %q", ErrNoHistory, t.Path)
 		}
 	}
-	if q.Shape == ShapeGroupBy && e.classifier.IsVolatile(q.GroupField) {
+	if q.Shape == ShapeGroupBy && cl.IsVolatile(q.GroupField) {
 		return fmt.Errorf("%w: %q", ErrNoHistory, q.GroupField)
 	}
 	return nil

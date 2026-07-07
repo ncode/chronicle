@@ -33,8 +33,8 @@ type Service struct {
 	cfg   *config.ServerConfig
 	log   *slog.Logger
 
-	classifier atomic.Pointer[classify.Policy] // hot-swappable volatile policy (task 7.1)
-	metrics    *metrics.Metrics                // nil-safe; set by the server
+	classifier *atomic.Pointer[classify.Policy] // shared hot-swappable volatile policy
+	metrics    *metrics.Metrics                 // nil-safe; set by the server
 
 	sem chan struct{} // bounded ingest concurrency (backpressure)
 
@@ -49,36 +49,21 @@ type Service struct {
 	dirtyOver   int            // count of certnames at/over the threshold (gauge source)
 }
 
-func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service, error) {
-	cl, err := classify.New(cfg.VolatilePaths)
-	if err != nil {
-		return nil, err
-	}
+func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger, classifier *atomic.Pointer[classify.Policy]) (*Service, error) {
 	s := &Service{
 		store:       st,
 		cfg:         cfg,
 		log:         log,
+		classifier:  classifier,
 		sem:         make(chan struct{}, cfg.MaxConcurrent),
 		limiters:    make(map[string]*rate.Limiter),
 		dirtyStreak: make(map[string]int),
 	}
-	s.classifier.Store(cl)
 	return s, nil
 }
 
 // SetMetrics attaches Prometheus instrumentation (optional).
 func (s *Service) SetMetrics(m *metrics.Metrics) { s.metrics = m }
-
-// ReloadVolatilePolicy rebuilds and atomically swaps the volatile classifier
-// (SIGHUP-driven hot reload, task 7.1). Unchanged on a bad pattern.
-func (s *Service) ReloadVolatilePolicy(patterns []string) error {
-	cl, err := classify.New(patterns)
-	if err != nil {
-		return err
-	}
-	s.classifier.Store(cl)
-	return nil
-}
 
 // Handler returns the ingest mux: the push endpoint plus the advertised limits.
 func (s *Service) Handler() http.Handler {

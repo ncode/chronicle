@@ -38,6 +38,17 @@ func testServerConfig() *config.ServerConfig {
 	}
 }
 
+func testPolicyHolder(t *testing.T, patterns []string) *atomic.Pointer[classify.Policy] {
+	t.Helper()
+	cl, err := classify.New(patterns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var holder atomic.Pointer[classify.Policy]
+	holder.Store(cl)
+	return &holder
+}
+
 func newStore(t *testing.T) (*store.Store, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("CHRONICLE_TEST_DB")
@@ -68,7 +79,7 @@ func startIngest(t *testing.T, st *store.Store, ca *testca.CA) *httptest.Server 
 	server := ca.IssueServer(t, "chronicle", "127.0.0.1")
 	cfg.TLS.ServerCert, cfg.TLS.ServerKey = server.Write(t, dir, "server")
 
-	svc, err := ingest.New(st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := ingest.New(st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +211,8 @@ func TestScaleSmoke(t *testing.T) {
 		t.Skip("scale smoke skipped in -short")
 	}
 	st, ctx := newStore(t)
-	svc, err := ingest.New(st, testServerConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cfg := testServerConfig()
+	svc, err := ingest.New(st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -292,11 +304,7 @@ type queryEngine struct{ store *store.Store }
 
 func (e *queryEngine) filter(t *testing.T, ctx context.Context, dsl string) []string {
 	t.Helper()
-	cl, err := classify.New(testServerConfig().VolatilePaths)
-	if err != nil {
-		t.Fatal(err)
-	}
-	qe := query.NewEngine(e.store, cl)
+	qe := query.NewEngine(e.store, testPolicyHolder(t, testServerConfig().VolatilePaths))
 	q, err := query.Parse(dsl)
 	if err != nil {
 		t.Fatalf("parse %q: %v", dsl, err)
