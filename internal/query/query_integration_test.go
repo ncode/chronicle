@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/store"
 )
 
@@ -35,11 +34,7 @@ func testEngine(t *testing.T) (*Engine, *store.Store, context.Context) {
 	if _, err := st.Pool().Exec(ctx, `TRUNCATE nodes, fact_paths RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
-	cl, err := classify.New([]string{"uptime", "memory.system.*"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &Engine{store: st, classifier: cl}, st, ctx
+	return NewEngine(st, testPolicyHolder(t, []string{"uptime", "memory.system.*"})), st, ctx
 }
 
 var (

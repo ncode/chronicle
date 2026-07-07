@@ -1,4 +1,4 @@
-package lifecycle
+package ingest
 
 import (
 	"context"
@@ -11,12 +11,11 @@ import (
 	"time"
 
 	"github.com/ncode/chronicle/internal/config"
-	"github.com/ncode/chronicle/internal/ingest"
 	"github.com/ncode/chronicle/internal/store"
 	"github.com/ncode/chronicle/internal/wire"
 )
 
-func setup(t *testing.T) (*store.Store, *ingest.Service, *Manager, context.Context) {
+func setup(t *testing.T) (*store.Store, *Service, context.Context) {
 	t.Helper()
 	dsn := os.Getenv("CHRONICLE_TEST_DB")
 	if dsn == "" {
@@ -37,11 +36,11 @@ func setup(t *testing.T) (*store.Store, *ingest.Service, *Manager, context.Conte
 		RateLimitPerMin: 1_000_000, MaxConcurrent: 64, VolatilePaths: []string{"uptime"},
 	}
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	svc, err := ingest.New(st, cfg, log)
+	svc, err := New(st, cfg, log, testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return st, svc, NewManager(st, log, 24*time.Hour), ctx
+	return st, svc, ctx
 }
 
 func wipe(t *testing.T, st *store.Store, ctx context.Context, certname string) {
@@ -51,7 +50,7 @@ func wipe(t *testing.T, st *store.Store, ctx context.Context, certname string) {
 	}
 }
 
-func push(t *testing.T, svc *ingest.Service, ctx context.Context, certname, tree string, ts, received time.Time) (wire.PushResponse, int) {
+func push(t *testing.T, svc *Service, ctx context.Context, certname, tree string, ts, received time.Time) (wire.PushResponse, int) {
 	t.Helper()
 	return svc.Apply(ctx, certname, &wire.Push{
 		ProducerTimestamp: ts, Tree: json.RawMessage(tree),
@@ -65,7 +64,7 @@ var (
 )
 
 func TestRebuildContinuesHistory(t *testing.T) {
-	st, svc, _, ctx := setup(t)
+	st, svc, ctx := setup(t)
 	wipe(t, st, ctx, "rebuild.node")
 
 	push(t, svc, ctx, "rebuild.node", `{"os":{"name":"Debian"},"machine_id":"AAAA"}`, lt1, lt1)
@@ -90,14 +89,14 @@ func TestRebuildContinuesHistory(t *testing.T) {
 }
 
 func TestExpiryRoundTrip(t *testing.T) {
-	st, svc, mgr, ctx := setup(t)
+	st, svc, ctx := setup(t)
 	wipe(t, st, ctx, "expiry.node")
 
 	// First contact 48h ago.
 	old := time.Now().Add(-48 * time.Hour)
 	push(t, svc, ctx, "expiry.node", `{"os":{"name":"Debian"}}`, old, old)
 
-	n, err := mgr.Sweep(ctx) // ttl 24h => the 48h-silent node expires
+	n, err := st.ExpireStale(ctx, 24*time.Hour) // ttl 24h => the 48h-silent node expires
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +115,7 @@ func TestExpiryRoundTrip(t *testing.T) {
 }
 
 func TestDeactivationSealsAndRejects(t *testing.T) {
-	st, svc, _, ctx := setup(t)
+	st, svc, ctx := setup(t)
 	wipe(t, st, ctx, "sunset.node")
 
 	push(t, svc, ctx, "sunset.node", `{"os":{"name":"Debian"}}`, lt1, lt1)

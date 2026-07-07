@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/store"
 	"github.com/ncode/chronicle/internal/wire"
@@ -43,11 +44,22 @@ func testService(t *testing.T) (*Service, *store.Store, context.Context) {
 		MaxConcurrent:   64,
 		VolatilePaths:   []string{"uptime", "memory.system.*"},
 	}
-	svc, err := New(st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	svc, err := New(st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
 	return svc, st, ctx
+}
+
+func testPolicyHolder(t *testing.T, patterns []string) *atomic.Pointer[classify.Policy] {
+	t.Helper()
+	cl, err := classify.New(patterns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var holder atomic.Pointer[classify.Policy]
+	holder.Store(cl)
+	return &holder
 }
 
 func wipeNode(t *testing.T, st *store.Store, ctx context.Context, certname string) {

@@ -14,9 +14,11 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/ingest"
 	"github.com/ncode/chronicle/internal/store"
@@ -33,6 +35,22 @@ func testReadConfig() *config.ServerConfig {
 		},
 		OIDC: config.OIDC{RolesClaim: "groups"},
 	}
+}
+
+func testPolicyHolder(t *testing.T, patterns []string) *atomic.Pointer[classify.Policy] {
+	t.Helper()
+	var holder atomic.Pointer[classify.Policy]
+	holder.Store(testPolicy(t, patterns))
+	return &holder
+}
+
+func testPolicy(t *testing.T, patterns []string) *classify.Policy {
+	t.Helper()
+	cl, err := classify.New(patterns)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cl
 }
 
 func testReadService(t *testing.T) (*Service, *store.Store, context.Context) {
@@ -53,7 +71,8 @@ func testReadService(t *testing.T) (*Service, *store.Store, context.Context) {
 	if _, err := st.Pool().Exec(ctx, `TRUNCATE nodes, fact_paths RESTART IDENTITY CASCADE`); err != nil {
 		t.Fatal(err)
 	}
-	svc, err := NewService(ctx, st, testReadConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cfg := testReadConfig()
+	svc, err := NewService(ctx, st, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +81,8 @@ func testReadService(t *testing.T) (*Service, *store.Store, context.Context) {
 
 func testReadServiceNoStore(t *testing.T) *Service {
 	t.Helper()
-	svc, err := NewService(t.Context(), nil, testReadConfig(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	cfg := testReadConfig()
+	svc, err := NewService(t.Context(), nil, cfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, cfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,6 +169,92 @@ func TestResetWatermarkRoleAndParamMapping(t *testing.T) {
 	}
 }
 
+func TestVolatileReloadFlipsIngestAndQueryTogether(t *testing.T) {
+	dsn := os.Getenv("CHRONICLE_TEST_DB")
+	if dsn == "" {
+		t.Skip("set CHRONICLE_TEST_DB to run query service integration tests")
+	}
+	ctx := context.Background()
+	st, err := store.Open(ctx, dsn, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	if _, err := st.Pool().Exec(ctx, `TRUNCATE nodes, fact_paths RESTART IDENTITY CASCADE`); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testReadConfig()
+	holder := testPolicyHolder(t, cfg.VolatilePaths)
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	readSvc, err := NewService(ctx, st, cfg, log, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ing, err := ingest.New(st, &config.ServerConfig{
+		MaxSkew:         config.Duration(5 * time.Minute),
+		MaxSnapshotByte: 8 << 20,
+		MaxLeafCount:    50000,
+		MaxPathLen:      1024,
+		MaxValueBytes:   256 << 10,
+		RateLimitPerMin: 1_000_000,
+		MaxConcurrent:   64,
+		VolatilePaths:   cfg.VolatilePaths,
+	}, log, holder)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	holder.Store(testPolicy(t, []string{"uptime", "reload.volatile"}))
+	ts := time.Now().UTC().Truncate(time.Microsecond)
+	status, body := httpPush(t, ing, "reload01", &wire.Push{
+		ProducerTimestamp: ts,
+		Tree:              json.RawMessage(`{"os":{"name":"Debian"},"reload":{"volatile":123}}`),
+		Discovery:         wire.DiscoveryStatus{Builtin: map[string]string{"os": wire.StatusOK}},
+	})
+	if status != http.StatusOK || body["applied"] != true {
+		t.Fatalf("push after reload = %d %+v, want applied", status, body)
+	}
+	id, _, err := st.NodeID(ctx, "reload01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	now, err := st.Now(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range now {
+		if row.Path == "reload.volatile" {
+			t.Fatalf("reload.volatile was stored durably: %+v", now)
+		}
+	}
+	// ...and it actually landed in the volatile blob (not silently dropped).
+	var vol string
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT volatile::text FROM node_volatile WHERE node_id=$1`, id).Scan(&vol); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(vol, `"reload.volatile"`) {
+		t.Fatalf("reload.volatile missing from node_volatile blob: %s", vol)
+	}
+
+	past := ts.Add(-time.Second).Format(time.RFC3339)
+	rec := serveRead(t, readSvc.Handler(), http.MethodGet, "/v1/query?q="+url.QueryEscape("reload.volatile=123 at "+past), "r-tok")
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("volatile at-T query = %d body %s, want 422", rec.Code, rec.Body.String())
+	}
+	var errBody map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&errBody); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(errBody["error"], ErrNoHistory.Error()) {
+		t.Fatalf("error body = %q, want %q", errBody["error"], ErrNoHistory.Error())
+	}
+}
+
 func TestQueryEndpointMapsErrors(t *testing.T) {
 	h := testReadServiceNoStore(t).Handler()
 	tests := []struct {
@@ -215,7 +321,7 @@ func TestDiffAndStateEndpointMapsErrors(t *testing.T) {
 
 func TestResetWatermarkEndToEnd(t *testing.T) {
 	svc, st, _ := testReadService(t)
-	ing, err := ingest.New(st, &config.ServerConfig{
+	ingCfg := &config.ServerConfig{
 		MaxSkew:         config.Duration(5 * time.Minute),
 		MaxSnapshotByte: 8 << 20,
 		MaxLeafCount:    50000,
@@ -224,7 +330,8 @@ func TestResetWatermarkEndToEnd(t *testing.T) {
 		RateLimitPerMin: 1_000_000,
 		MaxConcurrent:   64,
 		VolatilePaths:   []string{"uptime"},
-	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}
+	ing, err := ingest.New(st, ingCfg, slog.New(slog.NewTextHandler(io.Discard, nil)), testPolicyHolder(t, ingCfg.VolatilePaths))
 	if err != nil {
 		t.Fatal(err)
 	}

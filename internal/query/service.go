@@ -22,18 +22,18 @@ import (
 // Engine compiles and runs DSL queries against the temporal store.
 type Engine struct {
 	store      *store.Store
-	classifier *classify.Policy
+	classifier *atomic.Pointer[classify.Policy]
 }
 
 // NewEngine builds a query Engine over the store with a volatile classifier.
-func NewEngine(st *store.Store, cl *classify.Policy) *Engine {
-	return &Engine{store: st, classifier: cl}
+func NewEngine(st *store.Store, classifier *atomic.Pointer[classify.Policy]) *Engine {
+	return &Engine{store: st, classifier: classifier}
 }
 
 // Service is the read/admin HTTP surface (ADR-0010): DSL query, node_diff, and
 // admin actions, authenticated by OIDC/bearer tokens — never node certs.
 type Service struct {
-	engine atomic.Pointer[Engine]        // hot-swappable on volatile-policy reload (task 7.1)
+	engine *Engine
 	auth   atomic.Pointer[Authenticator] // hot-swappable on SIGHUP auth reload (task 4.1)
 	store  *store.Store
 	log    *slog.Logger
@@ -54,37 +54,24 @@ const maxAuthFailSources = 8192
 
 // NewService builds the read service, including the volatile classifier (shared
 // policy with ingest) and the authenticator.
-func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, log *slog.Logger) (*Service, error) {
-	cl, err := classify.New(cfg.VolatilePaths)
-	if err != nil {
-		return nil, err
+func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, log *slog.Logger, classifier *atomic.Pointer[classify.Policy]) (*Service, error) {
+	if classifier == nil || classifier.Load() == nil {
+		return nil, errors.New("volatile policy holder is not initialized")
 	}
 	auth, err := NewAuthenticator(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	s := &Service{
+		engine:     NewEngine(st, classifier),
 		store:      st,
 		log:        log,
 		failPerMin: cfg.AuthFailPerMin,
 		failLim:    make(map[string]*rate.Limiter),
 		failGlobal: rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.AuthFailPerMin)), cfg.AuthFailPerMin),
 	}
-	s.engine.Store(NewEngine(st, cl))
 	s.auth.Store(auth)
 	return s, nil
-}
-
-// ReloadVolatilePolicy rebuilds the query engine's classifier so read-side
-// volatile routing / at-rejection stays consistent with ingest after a SIGHUP
-// reload (task 7.1, keeps the two endpoints from disagreeing).
-func (s *Service) ReloadVolatilePolicy(patterns []string) error {
-	cl, err := classify.New(patterns)
-	if err != nil {
-		return err
-	}
-	s.engine.Store(NewEngine(s.store, cl))
-	return nil
 }
 
 // ReloadAuth rebuilds and atomically swaps the Authenticator on SIGHUP so a
@@ -225,7 +212,7 @@ func (s *Service) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	includeInactive := r.URL.Query().Get("include_inactive") == "true"
-	res, err := s.engine.Load().Run(r.Context(), q, includeInactive)
+	res, err := s.engine.Run(r.Context(), q, includeInactive)
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrNoHistory):

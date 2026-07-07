@@ -40,8 +40,8 @@ func TestClosedIntervalOverlapGuard(t *testing.T) {
 	// A push at 15:00 falls inside the closed [10:00, 20:00). The old open-only
 	// guard would have accepted it (no open interval) and created an overlap; the
 	// closed-interval bound rejects it as stale.
-	if err := applyErr(s, ctx, node, []DurableLeaf{mkLeaf(t, s, ctx, "os.name", `"B"`)}, at15, true); !errors.Is(err, ErrStaleApply) {
-		t.Fatalf("push at 15:00 into closed [10:00,20:00) = %v, want ErrStaleApply", err)
+	if err := applyErr(s, ctx, node, []DurableLeaf{mkLeaf(t, s, ctx, "os.name", `"B"`)}, at15, true); !errors.Is(err, errStaleApply) {
+		t.Fatalf("push at 15:00 into closed [10:00,20:00) = %v, want errStaleApply", err)
 	}
 
 	// A push exactly AT the closed valid_to (20:00) is adjacent, not overlapping

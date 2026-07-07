@@ -14,16 +14,18 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
+	"github.com/ncode/chronicle/internal/classify"
 	"github.com/ncode/chronicle/internal/config"
 	"github.com/ncode/chronicle/internal/ingest"
-	"github.com/ncode/chronicle/internal/lifecycle"
 	"github.com/ncode/chronicle/internal/metrics"
 	"github.com/ncode/chronicle/internal/monitor"
+	"github.com/ncode/chronicle/internal/periodic"
 	"github.com/ncode/chronicle/internal/query"
 	"github.com/ncode/chronicle/internal/store"
 	"github.com/ncode/chronicle/internal/version"
@@ -54,6 +56,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	volatilePolicy, err := classify.New(cfg.VolatilePaths)
+	if err != nil {
+		return err
+	}
+	var volatile atomic.Pointer[classify.Policy]
+	volatile.Store(volatilePolicy)
+
 	st, err := store.Open(ctx, cfg.DatabaseURL, cfg.PoolMaxConns)
 	if err != nil {
 		return err
@@ -66,7 +75,7 @@ func run() error {
 
 	m := metrics.New()
 
-	ingestSvc, err := ingest.New(st, cfg, log)
+	ingestSvc, err := ingest.New(st, cfg, log, &volatile)
 	if err != nil {
 		return err
 	}
@@ -79,7 +88,7 @@ func run() error {
 		log.Warn("no CRL configured; revocation not enforced at TLS")
 	}
 
-	querySvc, err := query.NewService(ctx, st, cfg, log)
+	querySvc, err := query.NewService(ctx, st, cfg, log, &volatile)
 	if err != nil {
 		return fmt.Errorf("read service: %w", err)
 	}
@@ -88,7 +97,6 @@ func run() error {
 		return fmt.Errorf("read TLS: %w", err)
 	}
 
-	lc := lifecycle.NewManager(st, log, cfg.ExpiryTTL.D())
 	mon := monitor.New(st, log)
 
 	// Timeouts so a slow client can't tie up connections (Slowloris). Ingest
@@ -110,7 +118,7 @@ func run() error {
 		WriteTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20,
 	}
 
-	go reloadOnHUP(ctx, log, *cfgPath, ingestSvc, querySvc, crl)
+	go reloadOnHUP(ctx, log, *cfgPath, &volatile, querySvc, crl)
 
 	// Each server runs two group goroutines: one serves, one waits for shutdown
 	// and drains. Both are in the errgroup, so g.Wait() blocks until every drain
@@ -123,7 +131,24 @@ func run() error {
 	}
 	g.Go(func() error { return serve(opsSrv) })
 	g.Go(func() error { return awaitShutdown(gctx, opsSrv) })
-	g.Go(func() error { lc.Run(gctx, time.Hour); return nil })
+	g.Go(func() error {
+		periodic.Run(gctx, time.Hour, log, "expiry sweep", func(ctx context.Context) {
+			ttl := cfg.ExpiryTTL.D()
+			if ttl <= 0 {
+				log.Error("expiry sweep", "err", fmt.Errorf("expiry ttl must be positive, got %s", ttl))
+				return
+			}
+			n, err := st.ExpireStale(ctx, ttl)
+			if err != nil {
+				log.Error("expiry sweep", "err", err)
+				return
+			}
+			if n > 0 {
+				log.Info("expiry sweep", "newly_expired", n)
+			}
+		})
+		return nil
+	})
 	g.Go(func() error { mon.Run(gctx, time.Hour); return nil })
 
 	log.Info("chronicle running",
@@ -154,9 +179,8 @@ func opsMux(st *store.Store, m *metrics.Metrics) http.Handler {
 }
 
 // reloadOnHUP re-reads the config on SIGHUP and hot-swaps the volatile policy
-// (on BOTH ingest and the read service, so they stay consistent) and the CRL
-// (task 7.1). Other knobs (caps, skew) take effect on restart.
-func reloadOnHUP(ctx context.Context, log *slog.Logger, cfgPath string, ingestSvc *ingest.Service, querySvc *query.Service, crl *ingest.CRLChecker) {
+// and the CRL. Other knobs (caps, skew) take effect on restart.
+func reloadOnHUP(ctx context.Context, log *slog.Logger, cfgPath string, volatile *atomic.Pointer[classify.Policy], querySvc *query.Service, crl *ingest.CRLChecker) {
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, syscall.SIGHUP)
 	for {
@@ -169,11 +193,11 @@ func reloadOnHUP(ctx context.Context, log *slog.Logger, cfgPath string, ingestSv
 				log.Error("reload: config", "err", err)
 				continue
 			}
-			ingestErr := ingestSvc.ReloadVolatilePolicy(cfg.VolatilePaths)
-			queryErr := querySvc.ReloadVolatilePolicy(cfg.VolatilePaths)
-			if ingestErr != nil || queryErr != nil {
-				log.Error("reload: volatile policy", "ingest_err", ingestErr, "query_err", queryErr)
+			cl, err := classify.New(cfg.VolatilePaths)
+			if err != nil {
+				log.Error("reload: volatile policy", "err", err)
 			} else {
+				volatile.Store(cl)
 				log.Info("reloaded volatile policy", "patterns", len(cfg.VolatilePaths))
 			}
 			// Auth reload: the static-token half always swaps (revoking a leaked
