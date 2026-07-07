@@ -50,6 +50,9 @@ type Service struct {
 }
 
 func New(st *store.Store, cfg *config.ServerConfig, log *slog.Logger, classifier *atomic.Pointer[classify.Policy]) (*Service, error) {
+	if classifier == nil || classifier.Load() == nil {
+		return nil, fmt.Errorf("volatile policy holder is not initialized")
+	}
 	s := &Service{
 		store:       st,
 		cfg:         cfg,

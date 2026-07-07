@@ -231,6 +231,15 @@ func TestVolatileReloadFlipsIngestAndQueryTogether(t *testing.T) {
 			t.Fatalf("reload.volatile was stored durably: %+v", now)
 		}
 	}
+	// ...and it actually landed in the volatile blob (not silently dropped).
+	var vol string
+	if err := st.Pool().QueryRow(ctx,
+		`SELECT volatile::text FROM node_volatile WHERE node_id=$1`, id).Scan(&vol); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(vol, `"reload.volatile"`) {
+		t.Fatalf("reload.volatile missing from node_volatile blob: %s", vol)
+	}
 
 	past := ts.Add(-time.Second).Format(time.RFC3339)
 	rec := serveRead(t, readSvc.Handler(), http.MethodGet, "/v1/query?q="+url.QueryEscape("reload.volatile=123 at "+past), "r-tok")

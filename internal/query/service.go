@@ -55,6 +55,9 @@ const maxAuthFailSources = 8192
 // NewService builds the read service, including the volatile classifier (shared
 // policy with ingest) and the authenticator.
 func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, log *slog.Logger, classifier *atomic.Pointer[classify.Policy]) (*Service, error) {
+	if classifier == nil || classifier.Load() == nil {
+		return nil, errors.New("volatile policy holder is not initialized")
+	}
 	auth, err := NewAuthenticator(ctx, cfg)
 	if err != nil {
 		return nil, err
