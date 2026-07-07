@@ -77,9 +77,9 @@ Fixture: `ingest.nodeSnapshot` = **60 leaves, 53 durable, 7 volatile** (pinned b
 These run per push/query but are **DB-bound**, so they need an integration benchmark against a
 real/`testcontainers` Postgres, not a microbenchmark:
 
-- `store.InternPath` **cache-miss** (store.go:73): `INSERT … ON CONFLICT` + `SELECT`. Cache
+- `store.internPath` **cache-miss** (store.go:73): `INSERT … ON CONFLICT` + `SELECT`. Cache
   *hits* are a map read under RLock — negligible, not worth benching.
-- `store.ApplyDurable` (the open/close/tombstone diff + batch) — the real per-push DB cost.
+- `store.applyDurable` (the open/close/tombstone diff + batch) — the real per-push DB cost.
 - `query.buildIntersect` / `termSubquery` / `LookupPath` / SQL exec (compile.go) — per query.
 
 Until these are measured, the DB-dominance claim below is a reasoned estimate, not data.
@@ -87,8 +87,8 @@ Until these are measured, the DB-dominance claim below is a reasoned estimate, n
 ## The decision (the point of this exercise)
 
 Full per-push CPU is **~43 µs / 689 allocs**. The real `/v1/push` then runs a per-node tx
-(PeekNode → begin → LockNode `FOR UPDATE` → ApplyDurable → UpsertVolatile → MarkContact →
-commit) = **~5–6 DB round-trips, fixed per push regardless of leaf count** (`InternPath` is
+(PeekNode → begin → lockNode `FOR UPDATE` → applyDurable → upsertVolatile → markContact →
+commit) = **~5–6 DB round-trips, fixed per push regardless of leaf count** (`internPath` is
 in-process cached, store.go:66, so leaf count drives CPU not round-trips). At ~50–200 µs per
 local-Postgres round-trip that's ~0.3–1.2 ms of DB wall time, dominating the 43 µs of CPU by
 roughly **7–28×**.

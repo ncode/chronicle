@@ -210,8 +210,12 @@ func TestRateLimitExemptFromContact(t *testing.T) {
 	if w := postPush(svc, "rl.node", mustJSON(t, mkPush(`{"os":{"name":"A"}}`, time.Now().Add(-time.Minute), clean))); w.Code != 200 {
 		t.Fatalf("first push = %d, want 200", w.Code)
 	}
-	if w := postPush(svc, "rl.node", mustJSON(t, mkPush(`{"os":{"name":"A"}}`, time.Now(), clean))); w.Code != 429 {
+	w := postPush(svc, "rl.node", mustJSON(t, mkPush(`{"os":{"name":"A"}}`, time.Now(), clean)))
+	if w.Code != 429 {
 		t.Fatalf("second push (rate limited) = %d, want 429", w.Code)
+	}
+	if got := w.Header().Get("Retry-After"); got != "10" {
+		t.Fatalf("rate-limit Retry-After = %q, want 10", got)
 	}
 	if got := testutil.ToFloat64(m.Rejects.WithLabelValues(wire.ReasonRateLimited)); got < 1 {
 		t.Fatal("rate-limit reject must be counted")

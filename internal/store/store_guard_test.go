@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// applyErr runs one ApplyDurable and returns its error (the apply helper fatals
+// applyErr runs one applyDurable and returns its error (the apply helper fatals
 // instead), so the reject-path guards are assertable.
 func applyErr(s *Store, ctx context.Context, nodeID int64, leaves []DurableLeaf, at time.Time, clean bool) error {
 	tx, err := s.pool.Begin(ctx)
@@ -15,7 +15,7 @@ func applyErr(s *Store, ctx context.Context, nodeID int64, leaves []DurableLeaf,
 		return err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck
-	if _, err := s.ApplyDurable(ctx, tx, nodeID, leaves, at, clean); err != nil {
+	if _, err := s.applyDurable(ctx, tx, nodeID, leaves, at, clean); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

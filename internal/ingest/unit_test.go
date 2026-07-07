@@ -96,6 +96,9 @@ func TestEarlyRejectsCounted(t *testing.T) {
 	if w.Code != 503 {
 		t.Fatalf("backpressure status = %d, want 503", w.Code)
 	}
+	if got := w.Header().Get("Retry-After"); got != "5" {
+		t.Fatalf("backpressure Retry-After = %q, want 5", got)
+	}
 	if got := testutil.ToFloat64(m.Rejects.WithLabelValues(wire.ReasonBackpressure)); got != 1 {
 		t.Fatalf("backpressure reject count = %v, want 1", got)
 	}
