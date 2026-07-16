@@ -27,14 +27,34 @@ type DiscoveryStatus struct {
 
 // Status values.
 const (
-	StatusOK    = "ok"
-	StatusError = "error"
+	StatusOK     = "ok"
+	StatusError  = "error"
+	StatusAbsent = "absent"
 )
 
-// Clean reports whether discovery had no source error this pass. An absent
-// external file is NOT an error (the script is gone → tombstone-eligible); only
-// an explicit error (present-but-failed) makes the pass dirty (carry-forward).
+// Valid reports whether every status belongs to the vocabulary for its source
+// kind. Empty reports are valid here; ingest owns the separate non-empty rule.
+func (d DiscoveryStatus) Valid() bool {
+	for _, s := range d.Builtin {
+		if s != StatusOK && s != StatusError {
+			return false
+		}
+	}
+	for _, s := range d.External {
+		if s != StatusOK && s != StatusError && s != StatusAbsent {
+			return false
+		}
+	}
+	return true
+}
+
+// Clean reports whether valid discovery had no source error this pass. An
+// absent external file is NOT an error (the script is gone → tombstone-eligible);
+// explicit errors and invalid values fail closed as dirty (carry-forward).
 func (d DiscoveryStatus) Clean() bool {
+	if !d.Valid() {
+		return false
+	}
 	for _, s := range d.Builtin {
 		if s == StatusError {
 			return false

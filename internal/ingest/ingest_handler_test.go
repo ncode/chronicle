@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -120,6 +121,63 @@ func TestEmptyTreePushDoesNotTombstone(t *testing.T) {
 	}
 	if !wmAfter.Equal(wmBefore) {
 		t.Fatalf("watermark advanced from %s to %s on a rejected push", wmBefore, wmAfter)
+	}
+}
+
+func TestInvalidDiscoveryStatusDoesNotMutateHistory(t *testing.T) {
+	svc, st, ctx := testService(t)
+	const certname = "invalid-discovery.node"
+	wipeNode(t, st, ctx, certname)
+
+	seedTS := time.Now().Add(-time.Minute)
+	seed := mkPush(`{"os":{"name":"Debian"},"role":"web"}`, seedTS, clean)
+	if w := postPush(svc, certname, mustJSON(t, seed)); w.Code != 200 {
+		t.Fatalf("seed push = %d, want 200", w.Code)
+	}
+	id := nodeID(t, st, ctx, certname)
+	var watermarkBefore time.Time
+	if err := st.Pool().QueryRow(ctx, `SELECT last_producer_ts FROM nodes WHERE node_id=$1`, id).Scan(&watermarkBefore); err != nil {
+		t.Fatal(err)
+	}
+	oldContact := time.Now().Add(-30 * 24 * time.Hour)
+	if _, err := st.Pool().Exec(ctx, `UPDATE nodes SET last_seen=$2 WHERE node_id=$1`, id, oldContact); err != nil {
+		t.Fatal(err)
+	}
+
+	malformed := mkPush(
+		`{"os":{"name":"Debian"}}`,
+		time.Now(),
+		wire.DiscoveryStatus{Builtin: map[string]string{"os": "unknown"}},
+	)
+	if w := postPush(svc, certname, mustJSON(t, malformed)); w.Code != http.StatusBadRequest {
+		t.Fatalf("malformed discovery push = %d, want 400", w.Code)
+	}
+
+	now, err := st.Now(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(now) != 2 {
+		t.Fatalf("malformed discovery push changed open facts: %+v", now)
+	}
+	var total, closed int
+	if err := st.Pool().QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE valid_to <> 'infinity')
+		FROM fact_history WHERE node_id=$1`, id).Scan(&total, &closed); err != nil {
+		t.Fatal(err)
+	}
+	if total != 2 || closed != 0 {
+		t.Fatalf("history = %d intervals, %d closed; want 2 open intervals", total, closed)
+	}
+	var watermarkAfter time.Time
+	if err := st.Pool().QueryRow(ctx, `SELECT last_producer_ts FROM nodes WHERE node_id=$1`, id).Scan(&watermarkAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !watermarkAfter.Equal(watermarkBefore) {
+		t.Fatalf("watermark advanced from %s to %s on malformed discovery", watermarkBefore, watermarkAfter)
+	}
+	if contact := lastSeen(t, st, ctx, certname); !contact.After(oldContact) {
+		t.Fatalf("rejected contact did not advance last_seen beyond %s: %s", oldContact, contact)
 	}
 }
 
