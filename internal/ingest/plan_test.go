@@ -56,6 +56,8 @@ func TestPlanRejects(t *testing.T) {
 	}{
 		{"zero timestamp", nil, time.Time{}, `{"os":{"name":"Debian"}}`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
 		{"missing report", nil, ts, `{"os":{"name":"Debian"}}`, wire.DiscoveryStatus{}, wire.ReasonBadRequest, http.StatusBadRequest},
+		{"invalid built-in status", nil, ts, `{"os":{"name":"Debian"}}`, wire.DiscoveryStatus{Builtin: map[string]string{"os": "unknown"}}, wire.ReasonBadRequest, http.StatusBadRequest},
+		{"invalid external status", nil, ts, `{"os":{"name":"Debian"}}`, wire.DiscoveryStatus{External: map[string]string{"/etc/facts.d/site.json": "unknown"}}, wire.ReasonBadRequest, http.StatusBadRequest},
 		{"empty tree", nil, ts, `{}`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
 		{"null tree", nil, ts, `null`, okReport(), wire.ReasonBadRequest, http.StatusBadRequest},
 		{"colliding paths", nil, ts, `{"a":{"b":1},"a.b":2}`, okReport(), wire.ReasonBadRequest + ": colliding path a.b", http.StatusBadRequest},

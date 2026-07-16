@@ -226,6 +226,9 @@ func plan(cfg *config.ServerConfig, cl *classify.Policy, push *wire.Push, receiv
 	if len(push.Discovery.Builtin) == 0 && len(push.Discovery.External) == 0 {
 		return planReject(badRequest())
 	}
+	if !push.Discovery.Valid() {
+		return planReject(badRequest())
+	}
 
 	tree, err := decodeTree(push.Tree)
 	if err != nil {

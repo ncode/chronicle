@@ -38,12 +38,59 @@ type Service struct {
 	store  *store.Store
 	log    *slog.Logger
 
-	// Per-source failed-auth limiter (task 4.5): throttles online brute-force of
-	// static tokens without touching legitimate authenticated traffic.
+	// Per-source failed-auth budget (task 4.5): throttles online brute-force and
+	// reserves capacity for concurrent credential checks.
 	failPerMin int
 	failMu     sync.Mutex
-	failLim    map[string]*rate.Limiter
-	failGlobal *rate.Limiter // shared fallback once failLim is full (bounds memory)
+	failLim    map[string]*authFailureBudget
+	failGlobal *authFailureBudget // shared fallback once failLim is full (bounds memory)
+}
+
+type authFailureBudget struct {
+	mu       sync.Mutex
+	limiter  *rate.Limiter
+	inFlight int
+	lastAt   time.Time
+}
+
+func newAuthFailureBudget(perMin int) *authFailureBudget {
+	return &authFailureBudget{
+		limiter: rate.NewLimiter(rate.Every(time.Minute/time.Duration(perMin)), perMin),
+	}
+}
+
+func (b *authFailureBudget) begin(at time.Time) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	at = b.monotonic(at)
+	if b.limiter.TokensAt(at) < float64(b.inFlight+1) {
+		return false
+	}
+	b.inFlight++
+	return true
+}
+
+func (b *authFailureBudget) settle(at time.Time, failed bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	at = b.monotonic(at)
+	if b.inFlight == 0 {
+		panic("query: auth failure budget settled without a reservation")
+	}
+	if failed && !b.limiter.AllowN(at, 1) {
+		panic("query: auth failure budget reservation invariant violated")
+	}
+	b.inFlight--
+}
+
+// monotonic prevents concurrent callers from rewinding rate.Limiter when their
+// timestamps were captured before they acquired the budget lock.
+func (b *authFailureBudget) monotonic(at time.Time) time.Time {
+	if at.Before(b.lastAt) {
+		return b.lastAt
+	}
+	b.lastAt = at
+	return at
 }
 
 // maxAuthFailSources caps the per-source failure-limiter map so an attacker
@@ -67,8 +114,8 @@ func NewService(ctx context.Context, st *store.Store, cfg *config.ServerConfig, 
 		store:      st,
 		log:        log,
 		failPerMin: cfg.AuthFailPerMin,
-		failLim:    make(map[string]*rate.Limiter),
-		failGlobal: rate.NewLimiter(rate.Every(time.Minute/time.Duration(cfg.AuthFailPerMin)), cfg.AuthFailPerMin),
+		failLim:    make(map[string]*authFailureBudget),
+		failGlobal: newAuthFailureBudget(cfg.AuthFailPerMin),
 	}
 	s.auth.Store(auth)
 	return s, nil
@@ -131,21 +178,21 @@ func (s *Service) audit(r *http.Request, action, target string) {
 // require authenticates the bearer credential, enforces the needed role, and
 // threads the authenticated principal into the request context for auditing.
 //
-// Brute-force resistance (task 4.5): the per-source failure budget is checked
-// BEFORE the credential is evaluated. Once a source burns its budget, further
-// attempts are refused without checking the token — so an attacker can't keep
-// guessing at full rate, and even a correct guess is blocked until the budget
-// refills. Legitimate traffic is unaffected: a successful auth never debits the
-// budget, so a source presenting a valid token never runs out.
+// Brute-force resistance (task 4.5): every credential check reserves from the
+// per-source failure budget before evaluation. Failures consume their
+// reservation; successes release it immediately without debit. Because validity
+// is not known before evaluation, excess concurrent valid attempts may be
+// refused until an admitted check settles.
 func (s *Service) require(need Role, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.authAttemptAllowed(r) {
+		budget := s.failBudget(r)
+		if !budget.begin(time.Now()) {
 			writeErr(w, http.StatusTooManyRequests, "too many authentication failures")
 			return
 		}
 		have, who, err := s.auth.Load().Authenticate(r.Context(), r)
+		budget.settle(time.Now(), err != nil)
 		if err != nil {
-			s.recordAuthFailure(r)
 			s.log.Warn("auth rejected", "err", err) // detail to logs, not the client
 			writeErr(w, http.StatusUnauthorized, "unauthorized")
 			return
@@ -160,10 +207,10 @@ func (s *Service) require(need Role, h http.HandlerFunc) http.Handler {
 	})
 }
 
-// failLimiter returns the failure limiter for a request's source, creating one
+// failBudget returns the failure budget for a request's source, creating one
 // while the map has room. Once the map is full (a possible source-IP spray), new
 // sources share failGlobal so memory stays bounded.
-func (s *Service) failLimiter(r *http.Request) *rate.Limiter {
+func (s *Service) failBudget(r *http.Request) *authFailureBudget {
 	src := r.RemoteAddr
 	if host, _, err := net.SplitHostPort(src); err == nil {
 		src = host
@@ -176,20 +223,9 @@ func (s *Service) failLimiter(r *http.Request) *rate.Limiter {
 	if len(s.failLim) >= maxAuthFailSources {
 		return s.failGlobal
 	}
-	lim := rate.NewLimiter(rate.Every(time.Minute/time.Duration(s.failPerMin)), s.failPerMin)
-	s.failLim[src] = lim
-	return lim
-}
-
-// authAttemptAllowed reports whether the source still has failure budget — a
-// peek that does NOT consume, so it can gate before the credential is checked.
-func (s *Service) authAttemptAllowed(r *http.Request) bool {
-	return s.failLimiter(r).Tokens() >= 1
-}
-
-// recordAuthFailure debits one token from the source's failure budget.
-func (s *Service) recordAuthFailure(r *http.Request) {
-	s.failLimiter(r).Allow()
+	budget := newAuthFailureBudget(s.failPerMin)
+	s.failLim[src] = budget
+	return budget
 }
 
 // maxDSLLen bounds the query string so an authenticated reader can't submit a
